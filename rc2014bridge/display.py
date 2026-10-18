@@ -660,7 +660,10 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         text = clip.decode("utf-8", "replace").replace("\x00", "")
         text = text.replace("\r\n", "\r").replace("\n", "\r")
         if text:
-            link.send_text(text, append_enter=False)
+            try:
+                link.send_text(text, append_enter=False)
+            except Exception as e:
+                _show_toast(f"Serial write failed: {e}", 4.0)
 
     def _sb_thumb_rect():
         """Scrollbar thumb rect for the current sb_offset/sb_history, or None."""
@@ -761,36 +764,27 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         else:
             _show_toast(f"XMODEM Error: {res.get('error', 'Failed')}")
 
+    def _on_ymodem_done(res: dict):
+        if res.get("ok"):
+            files = res.get("files", [])
+            _show_toast(f"YMODEM Success: {len(files)} file(s), "
+                        f"{res.get('bytes', 0)} bytes", 6.0)
+        else:
+            _show_toast(f"YMODEM Error: {res.get('error', 'Failed')}", 8.0)
+
     def _run_batch_upload(paths: list):
-        # The full composite (arm ZMD, transfer, wait out ZMD's exit - which
-        # cold-starts this board - and verify), so the menu item is one-shot
-        # like the MCP tools.
-        drive, user = _gui_target_du(link)
-        _show_toast(f"YMODEM batch upload: {len(paths)} file(s) to {drive}{user}: - "
-                    "the board cold-starts when ZMD exits (expected)", 6.0)
+        # Bare pipe, same contract as the single-file XMODEM menu items:
+        # the board side must already be armed (ZMD R). No arming, no
+        # drive/user targeting, no exists/free-space checks, no verify.
+        _show_toast(f"YMODEM batch send: {len(paths)} file(s) - "
+                    "arm ZMD on the board first (ZMD R)", 6.0)
+        files = [(p, os.path.basename(p)) for p in paths]
+        link.ymodem_send_async(files, callback=_on_ymodem_done)
 
-        def _worker():
-            res = link.upload_files(paths, drive, user=user)
-            if res.get("ok"):
-                _show_toast(f"YMODEM upload success: {res.get('file_count', 0)} file(s), "
-                            f"{res.get('bytes', 0)} bytes", 6.0)
-            else:
-                _show_toast(f"YMODEM upload error: {res.get('error', 'Failed')}", 8.0)
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _run_batch_download(names: list, dest_dir: str):
-        drive, user = _gui_target_du(link)
-        _show_toast(f"YMODEM batch download: {len(names)} file(s) from {drive}{user}: - "
-                    "the board cold-starts when ZMD exits (expected)", 6.0)
-
-        def _worker():
-            res = link.download_files(names, drive, user=user, dest_dir=dest_dir)
-            if res.get("ok"):
-                _show_toast(f"YMODEM download success: {res.get('file_count', 0)} file(s), "
-                            f"{res.get('bytes', 0)} bytes -> {dest_dir}", 6.0)
-            else:
-                _show_toast(f"YMODEM download error: {res.get('error', 'Failed')}", 8.0)
-        threading.Thread(target=_worker, daemon=True).start()
+    def _run_batch_download(dest_dir: str):
+        _show_toast("YMODEM batch receive - arm ZMD on the board first "
+                    "(ZMD SB <names>)", 6.0)
+        link.ymodem_receive_async(dest_dir, callback=_on_ymodem_done)
 
     def _on_scan_done(res: dict):
         if res.get("ok"):
@@ -843,11 +837,14 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     prompt_text = ""
             threading.Thread(target=_send_batch_worker, daemon=True).start()
         elif action == "PROMPT_RECEIVE_BATCH":
-            # The names live on the board - no host file dialog can offer
-            # them, so always ask on-screen; the destination folder dialog
-            # comes after Enter.
-            prompt_mode = "RECV_BATCH"
-            prompt_text = ""
+            # Bare receive: the board-side ZMD decides what gets sent, so
+            # only the destination folder is needed.
+            def _recv_batch_menu_worker():
+                dirs = _open_system_files_dialog(
+                    mode="dir", title="Select Destination Folder for YMODEM Batch")
+                if dirs:
+                    _run_batch_download(dirs[0])
+            threading.Thread(target=_recv_batch_menu_worker, daemon=True).start()
         elif action == "SCAN_DRIVES":
             _show_toast("Scanning RC2014 drives (A: .. J:)...", 6.0)
             link.scan_drives_async(callback=_on_scan_done)
@@ -1120,19 +1117,6 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                                 paths = target_path.split()
                                 if paths:
                                     _run_batch_upload(paths)
-                            elif current_mode == "RECV_BATCH":
-                                names = target_path.split()
-                                if names:
-                                    def _recv_batch_worker(names=names):
-                                        dirs = _open_system_files_dialog(
-                                            mode="dir",
-                                            title="Select Destination Folder for YMODEM Batch")
-                                        if dirs:
-                                            _run_batch_download(names, dirs[0])
-                                        else:
-                                            _show_toast("YMODEM download cancelled "
-                                                        "(no destination folder)")
-                                    threading.Thread(target=_recv_batch_worker, daemon=True).start()
                     elif event.key == pygame.K_BACKSPACE:
                         prompt_text = prompt_text[:-1]
                     elif event.unicode:
@@ -1203,10 +1187,23 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                 # can even truncate what that agent reads. Interrupts still go
                 # through, so cancelling a stuck transfer is always possible.
                 if link.is_transferring() and not _allowed_during_transfer(data):
-                    _show_toast("Transfer in progress - keys held back (Ctrl-X twice to cancel)", 2.5)
+                    _show_toast("Transfer in progress - keys held back (Ctrl-X to cancel)", 2.5)
                     continue
 
-                link.send_text(data.decode("latin-1"), append_enter=False)
+                # Ctrl-X mid-transfer also cancels on the host side: without
+                # this the protocol loop would wait out all its retry and
+                # overall timeouts (up to 10 minutes on YMODEM receive) after
+                # the board-side program exited. The byte still goes to the
+                # port, which is what makes XM/ZMD on the board abort.
+                if data == b"\x18" and link.is_transferring():
+                    link.request_cancel()
+
+                try:
+                    link.send_text(data.decode("latin-1"), append_enter=False)
+                except Exception as e:
+                    # A dead/unreconfigured port must not unwind run() and
+                    # take the bridge window with it.
+                    _show_toast(f"Serial write failed: {e}", 4.0)
 
         current_connection = (link.port, link.baud)
         if current_connection != last_seen_connection:
@@ -1422,7 +1419,6 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                 "SEND": "XMODEM SEND PATH:",
                 "RECEIVE": "XMODEM RECEIVE PATH:",
                 "SEND_BATCH": "YMODEM SEND HOST PATHS (space-separated):",
-                "RECV_BATCH": "YMODEM RECV 8.3 NAMES (space-separated):",
             }
             hdr_text = hdr_labels.get(prompt_mode, f"XMODEM {prompt_mode} PATH:")
             hdr_img = status_font.render(hdr_text, True, (255, 255, 200))

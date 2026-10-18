@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-18 — GUI transfers are bare pipes; Ctrl-X cancels host-side
+
+**Problem:** (1) The GUI menu/keybind transfers were inconsistent — single
+XMODEM was a bare pipe, but the YMODEM batch items ran the full composite
+(arming, drive/user targeting, exists/free-space checks, verify, ZMD
+cold-boot ride-out). (2) Ctrl-X during a transfer only reached the board;
+the host-side protocol loop had no cancel, so after the board-side program
+died the bridge sat in its retry/overall timeouts (up to 10 minutes on
+YMODEM receive) with a frozen screen — and an exception in the unprotected
+receive paths or the GUI key handler could kill the whole bridge process.
+
+**Fix:** (1) All four GUI transfer entries (Send, Receive, Send Batch,
+Receive Batch) are now bare protocol pipes: pick file(s), move bytes, toast
+the outcome. The board side must be armed by the user (`XM R/S`, `ZMD R`,
+`ZMD SB`) — same contract for all. No checks, no constraints; the MCP tools
+keep their composite behavior. (2) Ctrl-X during any transfer now cancels on
+the host side too: `request_cancel()` sets a flag every protocol loop
+consults (via `_xq_get`, which reads as CAN), and sends `CAN CAN` so a
+still-alive XM/ZMD aborts. Cancel exits promptly with "cancelled by user",
+nudge the prompt back, and skip the ZMD settle wait. `xmodem_receive`/
+`ymodem_receive` gained the `except` clause the send paths already had, all
+four async wrappers guarantee the callback fires, and the GUI key/paste
+handlers no longer let a serial write error unwind the event loop.
+
 ## 2026-10-07 — Post-ZMD "-- Hit a key" pause released automatically
 
 **Problem:** on the RC2014 Zed Mini (ZPM3), ZMD 1.50's exit stops at a

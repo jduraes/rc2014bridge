@@ -820,6 +820,11 @@ class SerialLink:
 
         self._mode = "terminal"
         self._mode_lock = threading.Lock()
+        # Host-side transfer cancel (Ctrl-X in the GUI). Every protocol loop
+        # consults this via _xq_get, so a user cancel ends the loop on its
+        # next 1s wake instead of waiting out handshake/retry/overall
+        # timeouts (up to 600s on YMODEM receive).
+        self._transfer_cancel = threading.Event()
         # Display-only: which viewport display.py draws. Deliberately
         # separate from _mode - _mode auto-reverts to "terminal" the
         # instant a pixel-stream frame's END_OF_FRAME is seen (so the
@@ -1904,10 +1909,19 @@ class SerialLink:
                         pos = banner_at
 
     def _xq_get(self, timeout):
+        # A host-side cancel (Ctrl-X) reads as CAN: every existing
+        # resp == CAN branch then doubles as a user-cancel exit.
+        if self._transfer_cancel.is_set():
+            return CAN
         try:
             return self._xmodem_q.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def _cancel_error(self) -> str:
+        """Error message distinguishing a user cancel from a peer CAN."""
+        return ("cancelled by user" if self._transfer_cancel.is_set()
+                else "receiver cancelled transfer")
 
     # ------------------------------------------------------------------
     # receive log
@@ -2280,6 +2294,18 @@ class SerialLink:
         except Exception:
             logger.exception("Failed to send XMODEM cancel")
 
+    def request_cancel(self):
+        """Cancel the in-flight transfer from the host side (GUI Ctrl-X).
+
+        Sets the flag every protocol loop consults via _xq_get, and sends
+        CAN CAN so a still-alive XM/ZMD peer aborts too. The keystroke
+        itself is forwarded separately by the GUI - that is what makes the
+        board-side program exit - but without this the loop would sit in
+        its retry/timeout waits for minutes afterwards.
+        """
+        self._transfer_cancel.set()
+        self._xmodem_cancel()
+
     @_exclusive("XMODEM send")
     def xmodem_send(self, path: str, handshake_timeout: float = 30.0,
                     nudge_prompt: bool = None) -> dict:
@@ -2317,6 +2343,7 @@ class SerialLink:
             time.sleep(0.3)
             with self._xmodem_q.mutex:
                 self._xmodem_q.queue.clear()
+            self._transfer_cancel.clear()
 
             with open(path, "rb") as f:
                 data = f.read()
@@ -2327,6 +2354,9 @@ class SerialLink:
             use_crc = None
             deadline = time.time() + handshake_timeout
             while time.time() < deadline:
+                if self._transfer_cancel.is_set():
+                    logger.info("xmodem_send: cancelled by user during handshake")
+                    return {"ok": False, "error": "cancelled by user"}
                 b = self._xq_get(timeout=1.0)
                 if b == ord("C"):
                     use_crc = True
@@ -2393,7 +2423,9 @@ class SerialLink:
                         if resp == CAN:
                             logger.warning("Receiver cancelled transfer on block %d", idx)
                             self._xmodem_cancel()
-                            return {"ok": False, "error": "receiver cancelled transfer"}
+                            if self._transfer_cancel.is_set() and nudge_prompt:
+                                self._write_raw(b"\r")  # bring the prompt back
+                            return {"ok": False, "error": self._cancel_error()}
                         logger.warning("Block %d/%d (attempt %d) got response %r, retrying", idx, len(blocks), attempt, hex(resp) if resp else None)
                     else:
                         self._xmodem_cancel()
@@ -2467,6 +2499,7 @@ class SerialLink:
             time.sleep(0.3)  # see comment in xmodem_send
             with self._xmodem_q.mutex:
                 self._xmodem_q.queue.clear()
+            self._transfer_cancel.clear()
 
             out = bytearray()
             use_crc = True
@@ -2479,6 +2512,11 @@ class SerialLink:
             last_block_size = BLOCK_SIZE
 
             while time.time() < deadline:
+                if self._transfer_cancel.is_set():
+                    logger.info("xmodem_receive: cancelled by user")
+                    self._xmodem_cancel()
+                    self._write_raw(b"\r")  # bring the prompt back
+                    return {"ok": False, "error": "cancelled by user"}
                 if not got_first:
                     if time.time() - started > handshake_timeout:
                         self._xmodem_cancel()
@@ -2507,7 +2545,7 @@ class SerialLink:
                             "block_size": last_block_size}
                 if b0 == CAN:
                     if self._xq_get(timeout=1.0) == CAN:
-                        return {"ok": False, "error": "sender cancelled transfer"}
+                        return {"ok": False, "error": self._cancel_error()}
                     continue
                 if b0 not in (SOH, STX):
                     continue  # ignore stray bytes between blocks
@@ -2552,28 +2590,35 @@ class SerialLink:
 
             self._xmodem_cancel()
             return {"ok": False, "error": "timed out waiting for sender"}
+        except Exception as e:  # noqa: BLE001 - never leave the sender hanging
+            logger.exception("Unexpected exception during xmodem_receive: %s", e)
+            self._xmodem_cancel()
+            return {"ok": False, "error": f"unexpected error: {e}"}
         finally:
             with self._mode_lock:
                 self._mode = "terminal"
                 self._xmodem_progress["active"] = False
 
-    def xmodem_send_async(self, path: str, callback=None):
+    def _async_worker(self, fn, callback):
+        """Run fn and always fire callback - a crashed transfer must never
+        leave the GUI without its completion toast."""
         def _worker():
-            res = self.xmodem_send(path)
+            try:
+                res = fn()
+            except Exception as e:  # noqa: BLE001 - the callback must fire
+                logger.exception("Transfer worker crashed: %s", e)
+                res = {"ok": False, "error": f"unexpected error: {e}"}
             if callback:
                 callback(res)
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         return t
 
+    def xmodem_send_async(self, path: str, callback=None):
+        return self._async_worker(lambda: self.xmodem_send(path), callback)
+
     def xmodem_receive_async(self, path: str, callback=None):
-        def _worker():
-            res = self.xmodem_receive(path)
-            if callback:
-                callback(res)
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        return t
+        return self._async_worker(lambda: self.xmodem_receive(path), callback)
 
     # ------------------------------------------------------------------
     # YMODEM sender/receiver (batch; the board-side program is ZMD)
@@ -2586,6 +2631,8 @@ class SerialLink:
         fished out of a stream that may hold strays."""
         deadline = time.time() + timeout
         while True:
+            if self._transfer_cancel.is_set():
+                return CAN
             remaining = deadline - time.time()
             if remaining <= 0:
                 return None
@@ -2629,7 +2676,7 @@ class SerialLink:
                 break
             if resp == CAN:
                 self._xmodem_cancel()
-                return {"ok": False, "error": "receiver cancelled transfer"}
+                return {"ok": False, "error": self._cancel_error()}
             logger.warning("Block 0 (%s, attempt %d) got response %r, retrying",
                            wire_name, attempt, hex(resp) if resp is not None else None)
         else:
@@ -2648,7 +2695,7 @@ class SerialLink:
                 break
             if b == CAN:
                 self._xmodem_cancel()
-                return {"ok": False, "error": "receiver cancelled transfer"}
+                return {"ok": False, "error": self._cancel_error()}
             logger.warning("No 'C' after block 0 ACK for %s (attempt %d); resending header",
                            wire_name, attempt)
             self._write_paced(header)
@@ -2675,7 +2722,7 @@ class SerialLink:
                     break
                 if resp == CAN:
                     self._xmodem_cancel()
-                    return {"ok": False, "error": "receiver cancelled transfer"}
+                    return {"ok": False, "error": self._cancel_error()}
                 logger.warning("Block %d/%d (%s, attempt %d) got response %r, retrying",
                                idx, len(blocks), wire_name, attempt,
                                hex(resp) if resp is not None else None)
@@ -2698,7 +2745,7 @@ class SerialLink:
                 continue  # standard YMODEM: first EOT is NAKed, resend, expect ACK
             if resp == CAN:
                 self._xmodem_cancel()
-                return {"ok": False, "error": "receiver cancelled transfer"}
+                return {"ok": False, "error": self._cancel_error()}
         if not eot_ack:
             self._xmodem_cancel()
             return {"ok": False, "error": f"EOT not acknowledged for {wire_name}"}
@@ -2738,6 +2785,7 @@ class SerialLink:
             time.sleep(0.3)
             with self._xmodem_q.mutex:
                 self._xmodem_q.queue.clear()
+            self._transfer_cancel.clear()
 
             results = []
             total_bytes = 0
@@ -2746,11 +2794,15 @@ class SerialLink:
                 # first of these waits is the handshake. Waiting per file
                 # (rather than once for the batch) keeps the pokes a receiver
                 # sends between files from being misread as header responses.
-                if self._xq_wait_for({ord("C")}, handshake_timeout) is None:
+                if self._xq_wait_for({ord("C")}, handshake_timeout) != ord("C"):
                     self._xmodem_cancel()
-                    err = ("handshake timeout waiting for receiver" if idx == 1
-                           else f"timeout waiting for receiver before file "
-                                f"{idx} ({wire_name})")
+                    if self._transfer_cancel.is_set():
+                        err = "cancelled by user"
+                    elif idx == 1:
+                        err = "handshake timeout waiting for receiver"
+                    else:
+                        err = (f"timeout waiting for receiver before file "
+                               f"{idx} ({wire_name})")
                     logger.error("ymodem_send: %s", err)
                     return {"ok": False, "files": results, "error": err}
                 with open(host_path, "rb") as f:
@@ -2764,10 +2816,11 @@ class SerialLink:
 
             # Batch end: the receiver pokes 'C' for another header and gets
             # the all-NUL block 0 instead.
-            if self._xq_wait_for({ord("C")}, handshake_timeout) is None:
+            if self._xq_wait_for({ord("C")}, handshake_timeout) != ord("C"):
                 self._xmodem_cancel()
-                return {"ok": False, "files": results,
-                        "error": "timeout waiting for receiver at batch end"}
+                err = ("cancelled by user" if self._transfer_cancel.is_set()
+                       else "timeout waiting for receiver at batch end")
+                return {"ok": False, "files": results, "error": err}
             for attempt in range(1, MAX_RETRIES + 1):
                 self._write_paced(self._ymodem_block0("", None))
                 resp = self._xq_get(timeout=10.0)
@@ -2776,7 +2829,7 @@ class SerialLink:
                 if resp == CAN:
                     self._xmodem_cancel()
                     return {"ok": False, "files": results,
-                            "error": "receiver cancelled transfer"}
+                            "error": self._cancel_error()}
             else:
                 self._xmodem_cancel()
                 return {"ok": False, "files": results,
@@ -2794,11 +2847,12 @@ class SerialLink:
             with self._mode_lock:
                 self._mode = "terminal"
                 self._xmodem_progress["active"] = False
-            if pre_state == "cpm":
+            if pre_state == "cpm" and not self._transfer_cancel.is_set():
                 # ZMD's exit cold-starts some boards: a CR nudge (xmodem_send's
                 # style) would land in the boot loader. Wait the reboot out
                 # passively instead - quick when this board's ZMD just returns
-                # to the prompt.
+                # to the prompt. A user cancel skips this: the whole point is
+                # to hand control back immediately.
                 self._settle_after_zmd()
 
     @_exclusive("YMODEM receive")
@@ -2853,6 +2907,7 @@ class SerialLink:
             time.sleep(0.3)  # see comment in xmodem_send
             with self._xmodem_q.mutex:
                 self._xmodem_q.queue.clear()
+            self._transfer_cancel.clear()
 
             files = []
             started = time.time()
@@ -2873,6 +2928,10 @@ class SerialLink:
             final_c_at = None
 
             while time.time() < deadline:
+                if self._transfer_cancel.is_set():
+                    logger.info("ymodem_receive: cancelled by user")
+                    self._xmodem_cancel()
+                    return {"ok": False, "files": files, "error": "cancelled by user"}
                 if expect_block == 0:
                     if not files:
                         if time.time() - started > handshake_timeout:
@@ -2959,7 +3018,7 @@ class SerialLink:
                                         "clean batch end", expected_files)
                             break
                         return {"ok": False, "files": files,
-                                "error": "sender cancelled transfer"}
+                                "error": self._cancel_error()}
                     continue
                 if b0 not in (SOH, STX):
                     continue  # ignore stray bytes between blocks
@@ -3035,32 +3094,25 @@ class SerialLink:
             total = sum(f["bytes"] for f in files)
             return {"ok": True, "files": files, "file_count": len(files),
                     "bytes": total, "dest_dir": os.path.abspath(dest_dir)}
+        except Exception as e:  # noqa: BLE001 - never leave the sender hanging
+            logger.exception("Unexpected exception during ymodem_receive: %s", e)
+            self._xmodem_cancel()
+            return {"ok": False, "files": files, "error": f"unexpected error: {e}"}
         finally:
             with self._mode_lock:
                 self._mode = "terminal"
                 self._xmodem_progress["active"] = False
-            if pre_state == "cpm":
+            if pre_state == "cpm" and not self._transfer_cancel.is_set():
                 # ZMD's exit cold-starts some boards - wait out the reboot
-                # before the caller (or an agent) types anything else.
+                # before the caller (or an agent) types anything else. A user
+                # cancel skips this to hand control back immediately.
                 self._settle_after_zmd()
 
     def ymodem_send_async(self, files: list[tuple[str, str]], callback=None):
-        def _worker():
-            res = self.ymodem_send(files)
-            if callback:
-                callback(res)
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        return t
+        return self._async_worker(lambda: self.ymodem_send(files), callback)
 
     def ymodem_receive_async(self, dest_dir: str, callback=None):
-        def _worker():
-            res = self.ymodem_receive(dest_dir)
-            if callback:
-                callback(res)
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        return t
+        return self._async_worker(lambda: self.ymodem_receive(dest_dir), callback)
 
     # ------------------------------------------------------------------
     # composite file operations
