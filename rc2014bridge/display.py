@@ -556,7 +556,25 @@ def window_title(link, base: str = "RC2014 Bridge") -> str:
     return f"{base} - {machine}" if machine else f"{base} - {link.port}"
 
 
-def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str = "RC2014 Bridge"):
+def _saved_window_size(config_path, cell_w, cell_h, min_cols=20, min_rows=5):
+    """The window size last persisted under [window] in the config file, or
+    None if there isn't a usable one. Values that can't hold the minimum
+    grid plus the menu/status/scrollbar chrome (or aren't positive ints)
+    are rejected so a stale or hand-edited value never opens a window too
+    small to work with."""
+    cfg = bridge_config.load(config_path)
+    try:
+        w = int(cfg.get("width", ""))
+        h = int(cfg.get("height", ""))
+    except ValueError:
+        return None
+    min_w = min_cols * cell_w + SCROLLBAR_W
+    min_h = TOP_MENU_HEIGHT + min_rows * cell_h + STATUS_BAR_HEIGHT
+    return (w, h) if w >= min_w and h >= min_h else None
+
+
+def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str = "RC2014 Bridge",
+        window_size_from_cli: bool = False):
     pygame.init()
     caption = window_title(link, title)
     pygame.display.set_caption(caption)
@@ -574,11 +592,23 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     # scaled-down font). `surface` is a canvas exactly matching the current
     # grid, so window coords and canvas coords stay 1:1 and no mouse mapping
     # is needed; the canvas is rebuilt whenever the grid changes.
+    if not window_size_from_cli:
+        saved = _saved_window_size(config_path, cell_w, cell_h)
+        if saved:
+            screen_w, screen_h = saved
     surface = pygame.Surface((screen_w, screen_h))
     window = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
     pygame.scrap.init()  # needs the window to exist (Windows scrap is window-bound)
     pygame.key.set_repeat(500, 33)  # Tera Term-style autorepeat: 500ms delay, ~30/s
     clock = pygame.time.Clock()
+
+    persisted_size = window.get_size()  # last size written to the config file
+    pending_size = None                 # resize awaiting the debounce
+    pending_since = 0.0
+
+    def _persist_window_size(size):
+        bridge_config.update_value(config_path, "window", "width", str(size[0]))
+        bridge_config.update_value(config_path, "window", "height", str(size[1]))
 
     scroll_offset = 0
     sb_history = 0      # scrollback lines available, synced from get_screen()
@@ -878,6 +908,17 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         # grid exactly; the window itself may be a few px larger (non
         # cell-multiple), which the present step pads with background.
         ww, wh = window.get_size()
+        if not window_size_from_cli and (ww, wh) != persisted_size:
+            # Debounce: a drag-resize changes the size every frame, so only
+            # write once it has been stable for a moment. A quit inside the
+            # window is caught by the exit backstop after the loop.
+            now = time.monotonic()
+            if pending_size != (ww, wh):
+                pending_size, pending_since = (ww, wh), now
+            elif now - pending_since >= 0.75:
+                _persist_window_size((ww, wh))
+                persisted_size = (ww, wh)
+                pending_size = None
         new_cols = max(20, (ww - SCROLLBAR_W) // cell_w)
         new_rows = max(5, (wh - TOP_MENU_HEIGHT - STATUS_BAR_HEIGHT) // cell_h)
         if (new_cols, new_rows) != (link.cols, link.rows):
@@ -1739,6 +1780,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         window.blit(surface, (0, 0))
         pygame.display.flip()
         clock.tick(60)
+
+    if not window_size_from_cli:
+        # Backstop: a quit within the debounce window above would otherwise
+        # drop the final size.
+        final_size = window.get_size()
+        if final_size != persisted_size:
+            _persist_window_size(final_size)
 
     for pw in pixel_windows:
         pw.destroy()

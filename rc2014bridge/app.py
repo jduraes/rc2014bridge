@@ -173,7 +173,12 @@ def main():
             logging.warning("Failed to start MCP server: %s", e)
 
     try:
-        run_display(link, config_path=args.config)
+        # An explicit --cols/--rows pins the grid, so the GUI must neither
+        # restore nor persist a window size. argparse defaults are
+        # config-seeded, so after parsing an explicit flag is
+        # indistinguishable from a config default - scan argv instead.
+        grid_from_cli = any(a.split("=", 1)[0] in ("--cols", "--rows") for a in sys.argv[1:])
+        run_display(link, config_path=args.config, window_size_from_cli=grid_from_cli)
     finally:
         if mcp_server:
             mcp_server.stop()
