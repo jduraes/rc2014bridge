@@ -14,7 +14,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from rc2014bridge.link import ACK, BLOCK_SIZE, EOT, NAK, SOH, SUB, SerialLink, _crc16
+from rc2014bridge.link import (ACK, BLOCK_SIZE, EOT, LONG_BLOCK_SIZE, NAK,
+                               SOH, STX, SUB, SerialLink, _crc16)
 
 from fakes import FakeSerial
 
@@ -26,21 +27,23 @@ def _scratch_hw_info() -> str:
 
 
 class ScriptedReceiver(threading.Thread):
-    """Stands in for RomWBW's XM receiving a file: pokes 'C', then ACKs each
-    well-formed block, recording the sequence number it saw."""
+    """Stands in for RomWBW's XM receiving a file: pokes 'C' (or NAK for the
+    checksum path), then ACKs each well-formed block, recording the sequence
+    number it saw. Accepts both 128-byte SOH and 1024-byte STX (XMODEM-1K)
+    packets, as a real receiver does."""
 
     def __init__(self, port: FakeSerial, use_crc: bool = True):
         super().__init__(daemon=True)
         self.port = port
         self.use_crc = use_crc
         self.headers: list[int] = []
+        self.block_sizes: list[int] = []
         self.payloads: list[bytes] = []
         self.saw_eot = False
         self._stop = threading.Event()
 
     def run(self):
         trailer = 2 if self.use_crc else 1
-        packet_len = 3 + BLOCK_SIZE + trailer
         poke = b"C" if self.use_crc else bytes([NAK])
         next_poke = 0.0
         cursor = 0
@@ -60,14 +63,17 @@ class ScriptedReceiver(threading.Thread):
                 cursor += 1
                 self.port.feed(bytes([ACK]))
                 return
-            if buf[0] != SOH:
+            if buf[0] not in (SOH, STX):
                 cursor += 1  # stray byte (the startup CR probe, for instance)
                 continue
+            size = BLOCK_SIZE if buf[0] == SOH else LONG_BLOCK_SIZE
+            packet_len = 3 + size + trailer
             if len(buf) < packet_len:
                 time.sleep(0.005)
                 continue
             self.headers.append(buf[1])
-            self.payloads.append(bytes(buf[3:3 + BLOCK_SIZE]))
+            self.block_sizes.append(size)
+            self.payloads.append(bytes(buf[3:3 + size]))
             cursor += packet_len
             self.port.feed(bytes([ACK]))
 
@@ -92,7 +98,10 @@ class TestXmodemSender(unittest.TestCase):
 
     def test_block_numbers_advance(self):
         link, fake = self._link()
-        receiver = ScriptedReceiver(fake)
+        # Checksum (NAK) mode keeps classic 128-byte blocks, so 512 bytes is
+        # still 4 blocks - multi-block sequencing is what this regression test
+        # is about.
+        receiver = ScriptedReceiver(fake, use_crc=False)
 
         payload = bytes(range(256)) * 2  # 512 bytes -> exactly 4 blocks
         with tempfile.NamedTemporaryFile(delete=False) as tf:
@@ -107,10 +116,36 @@ class TestXmodemSender(unittest.TestCase):
 
         self.assertTrue(res.get("ok"), res)
         self.assertEqual(res["blocks"], 4)
+        self.assertEqual(res["block_size"], BLOCK_SIZE)
         self.assertEqual(receiver.headers, [1, 2, 3, 4],
                          "each block must carry its own sequence number")
         self.assertEqual(b"".join(receiver.payloads), payload,
                          "the receiver must see every byte of the file, in order")
+        self.assertTrue(receiver.saw_eot)
+
+    def test_crc_mode_sends_1k_blocks(self):
+        """XMODEM-1K: a receiver that initiates with 'C' gets 1024-byte STX
+        packets - the sender picks the block size."""
+        link, fake = self._link()
+        receiver = ScriptedReceiver(fake)  # pokes 'C'
+
+        payload = bytes(range(256)) * 8  # 2048 bytes -> exactly 2x 1K blocks
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(payload)
+            path = tf.name
+        self.addCleanup(os.unlink, path)
+
+        receiver.start()
+        with _unpaced(link):
+            res = link.xmodem_send(path)
+        receiver.stop()
+
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["blocks"], 2)
+        self.assertEqual(res["block_size"], LONG_BLOCK_SIZE)
+        self.assertEqual(receiver.headers, [1, 2])
+        self.assertEqual(receiver.block_sizes, [LONG_BLOCK_SIZE, LONG_BLOCK_SIZE])
+        self.assertEqual(b"".join(receiver.payloads), payload)
         self.assertTrue(receiver.saw_eot)
 
     def test_block_header_complement_and_crc(self):
@@ -118,7 +153,7 @@ class TestXmodemSender(unittest.TestCase):
         receiver = ScriptedReceiver(fake)
 
         with tempfile.NamedTemporaryFile(delete=False) as tf:
-            tf.write(b"A" * 200)  # 2 blocks, second one padded
+            tf.write(b"A" * 200)  # 1 block, padded
             path = tf.name
         self.addCleanup(os.unlink, path)
 
@@ -129,13 +164,13 @@ class TestXmodemSender(unittest.TestCase):
 
         self.assertTrue(res.get("ok"), res)
         raw = bytes(fake.written)
-        first = raw.index(bytes([SOH]))
-        packet = raw[first:first + 3 + BLOCK_SIZE + 2]
+        first = raw.index(bytes([STX]))
+        packet = raw[first:first + 3 + LONG_BLOCK_SIZE + 2]
         self.assertEqual(packet[1] ^ packet[2], 0xFF, "header must be blocknum/~blocknum")
-        block = packet[3:3 + BLOCK_SIZE]
+        block = packet[3:3 + LONG_BLOCK_SIZE]
         crc = _crc16(block)
         self.assertEqual(packet[-2:], bytes([crc >> 8, crc & 0xFF]))
-        # Final short block is padded to a full 128 bytes with 0x1A
+        # Final short block is padded to a full 1024 bytes with 0x1A
         self.assertEqual(receiver.payloads[-1][-1], SUB)
 
     def test_no_prompt_nudge_when_no_os_is_running(self):

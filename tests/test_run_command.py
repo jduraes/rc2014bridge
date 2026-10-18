@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from rc2014bridge.link import RX_LOG_MAX, SerialLink, _strip_echo_and_prompt
+from rc2014bridge.link import RX_LOG_MAX, SerialLink, _prepare_cpm_command, _strip_echo_and_prompt
 
 from fakes import FakeSerial
 
@@ -298,6 +298,50 @@ class TestOperationLock(LinkTestCase):
             self.feed_later(b"DIR\r\nNO FILE\r\nA>", after=0.1)
             res = self.link.run_command("DIR", timeout=3.0)
         self.assertFalse(res.get("busy"), res)
+
+
+class TestZpm3CommandDialect(LinkTestCase):
+    def setUp(self):
+        super().setUp()
+        self.link._zpm3 = True
+        self.link._system_state = "cpm"
+
+    def test_bare_stat_is_blocked_without_wire_traffic(self):
+        res = self.link.run_command("STAT", timeout=1.0)
+        self.assertFalse(res["ok"])
+        self.assertIn("ZPM3", res["error"])
+        self.assertNotIn(b"STAT", bytes(self.fake.written))
+
+    def test_stat_drive_translated_to_sdz(self):
+        self.feed_later(b"Free: 100k\r\nA1>", after=0.1)
+        res = self.link.run_command("STAT A:", timeout=2.0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res.get("translated_to"), "SDZ A:")
+        self.assertIn(b"SDZ A:", bytes(self.fake.written))
+
+    def test_stat_file_translated_to_sdz(self):
+        self.feed_later(b"VTUNE   .COM  16k :\r\nFree: 100k\r\nA1>", after=0.1)
+        res = self.link.run_command("STAT A1:VTUNE.COM", timeout=2.0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res.get("translated_to"), "SDZ A1:VTUNE.COM")
+
+    def test_dir_user_area_translated_to_sdz(self):
+        self.feed_later(b"NO FILE\r\nF3>", after=0.1)
+        res = self.link.run_command("DIR F3:", timeout=2.0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res.get("translated_to"), "SDZ F3:")
+
+
+class TestPrepareCpmCommand(unittest.TestCase):
+    def test_classic_cp_m_untouched(self):
+        prep = _prepare_cpm_command("STAT A:", zpm3=False)
+        self.assertEqual(prep["send"], "STAT A:")
+        self.assertIsNone(prep["blocked"])
+
+    def test_zpm3_bare_stat_blocked(self):
+        prep = _prepare_cpm_command("STAT", zpm3=True)
+        self.assertIsNone(prep["send"])
+        self.assertIn("ZPM3", prep["blocked"])
 
 
 if __name__ == "__main__":

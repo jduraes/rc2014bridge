@@ -11,6 +11,26 @@ DEFAULT_LOG = "rc2014bridge.log"
 DEFAULT_HW_INFO = "hardware_info.json"
 
 
+class _SafeStreamHandler(logging.StreamHandler):
+    """StreamHandler that survives the console handle going away.
+
+    When the bridge's process ends up detached from a usable console,
+    stderr flushes fail with OSError EINVAL and the stock handler answers
+    every log record with a full '--- Logging error ---' traceback of its
+    own - far noisier than whatever was being logged. Swallow it instead;
+    the FileHandler still has the record.
+    """
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except (OSError, ValueError):
+            pass
+
+    def handleError(self, record):
+        pass
+
+
 def _cfg_str(cfg: dict, key: str, fallback):
     val = cfg.get(key)
     return val if val else fallback
@@ -76,8 +96,35 @@ def main():
                    help="Enable hardware RTS/CTS flow control on the serial port. "
                         "Experimental: only meaningful if both the board and the cable "
                         "actually wire CTS/RTS through (default: off)")
+    p.add_argument("--xm-command", metavar="CMD", default=_cfg_str(cfg, "xm-command", ""),
+                   help="Override how XM is invoked for transfers, e.g. 'XM' to use the "
+                        "current drive's copy instead of the ROM disk's (default: ROM disk)")
+    p.add_argument("--zmd-command", metavar="CMD", default=_cfg_str(cfg, "zmd-command", ""),
+                   help="Override how ZMD is invoked for YMODEM batch transfers, e.g. 'ZMD' "
+                        "to use the current drive's copy instead of the ROM disk's "
+                        "(default: ROM disk)")
     p.add_argument("--verbose", "-v", action="store_true", default=_cfg_bool(cfg, "verbose", False),
                    help="Enable DEBUG level logging")
+    p.add_argument("--pixel-stream", action="store_true", default=_cfg_bool(cfg, "pixel-stream", True),
+                   help="Auto-detect Mandel Pixel-Stream banners (0xFA) and switch the "
+                        "display/reader to pixel_stream mode (default: on)")
+    p.add_argument("--no-pixel-stream", dest="pixel_stream", action="store_false",
+                   help="Never auto-switch on 0xFA - use when no Mandel renderer is in play, "
+                        "so a stray 0xFA (serial noise, binary output) can't eat the console")
+    p.add_argument("--cpnet-share", metavar="DIR", default=_cfg_str(cfg, "cpnet-share", ""),
+                   help="Host directory staged into the CP/NET share for rc2014_cpnet_push "
+                        "(default: unset - the tool refuses to run until one is set)")
+    p.add_argument("--cpnet-server-command", metavar="PATH", default=_cfg_str(cfg, "cpnet-server-command", ""),
+                   help="Launcher used to auto-start the CP/NET socket server when it is not "
+                        "listening (default: unset - no auto-start)")
+    p.add_argument("--cpnet-port", type=int, default=_cfg_int(cfg, "cpnet-port", 31100),
+                   help="TCP port of the CP/NET socket server (default: %(default)s)")
+    p.add_argument("--cpnet-tools-du", metavar="DU:", default=_cfg_str(cfg, "cpnet-tools-du", ""),
+                   help="Drive/user holding NDOS3/NETWORK, e.g. 'A4:' - switch there before "
+                        "loading NDOS3 (default: rely on the system search path)")
+    p.add_argument("--cpnet-network-map", metavar="MAP", default=_cfg_str(cfg, "cpnet-network-map", "K:=C:[0]"),
+                   help="NETWORK mapping for the CP/NET share (default: %(default)s; the "
+                        "letter before := becomes the remote drive, user 0)")
     args = p.parse_args()
 
     def _pacing(value):
@@ -92,21 +139,33 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.FileHandler(args.log_file, mode="a"),
-            logging.StreamHandler(sys.stderr),
+            _SafeStreamHandler(sys.stderr),
         ],
     )
+    # The MCP library logs every stateless session teardown at INFO
+    # ("Terminating session: None") - pure noise on a single-client bridge.
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
     logging.info("Starting RC2014 Bridge on %s @ %d baud", args.port, args.baud)
 
     link = SerialLink(args.port, baud=args.baud, cols=args.cols, rows=args.rows,
                       hw_info_file=args.hw_info,
                       text_pacing=_pacing(args.text_pacing),
                       xmodem_pacing=_pacing(args.xmodem_pacing),
-                      rtscts=args.rtscts)
+                      rtscts=args.rtscts,
+                      xm_command=args.xm_command,
+                      zmd_command=args.zmd_command,
+                      pixel_stream=args.pixel_stream)
 
     mcp_server = None
     if args.mcp:
         try:
-            mcp_server = McpServer(link, host=args.mcp_host, port=args.mcp_port)
+            cpnet = {"share": args.cpnet_share,
+                     "server_command": args.cpnet_server_command,
+                     "port": args.cpnet_port,
+                     "tools_du": args.cpnet_tools_du,
+                     "network_map": args.cpnet_network_map}
+            mcp_server = McpServer(link, host=args.mcp_host, port=args.mcp_port,
+                                   cpnet=cpnet)
             mcp_server.start()
             for url in mcp_server.endpoints():
                 logging.info("MCP endpoint: %s", url)

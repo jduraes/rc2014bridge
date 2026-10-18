@@ -313,8 +313,12 @@ send-then-poll loop.
 | `rc2014_send_keys` | Control characters, nothing appended — `^C`, `^X<PAUSE>^X`, `<ESC>`. The only tool allowed to run mid-operation, because interrupting one is the point. |
 | `rc2014_wait_for` | Wait for a regex in output arriving *from now on*. |
 | `rc2014_wait_until_ready` | Wait for a boot to finish and the prompt to settle. Call after booting a disk — a boot profile keeps running programs, and commands sent during that window are lost. |
-| `rc2014_upload` | Content → board, zipped over XMODEM, UNZIPed, verified with `DIR`. `binary=false` (default) applies CP/M's CRLF + EOF-marker convention for text. |
-| `rc2014_download` | Board file → content inline, sha256, over XMODEM in 1K blocks. `binary=false` returns text, `binary=true` base64. |
+| `rc2014_upload_file` | **Default upload.** Host path → board over raw XMODEM, verified with `DIR`. No file content crosses MCP. |
+| `rc2014_download_file` | **Default download.** Board file → host path over XMODEM in 1K blocks; returns path, size, sha256. |
+| `rc2014_upload_files` | **Batch upload.** Several host paths → board in one YMODEM batch (`ZMD R`): one arming, 1K blocks. Prefer for multi-file work. |
+| `rc2014_download_files` | **Batch download.** Several board files → host directory in one YMODEM batch (`ZMD SB <names>`; the `B` forces batch mode so a one-file download still gets a block-0 header), with sha256. `strip_padding=false` for byte-exact binary (ZMD advertises 1K-rounded sizes; CP/M record granularity applies). |
+| `rc2014_upload` | Inline content → board, zipped over XMODEM, UNZIPed, verified. For content that only lives in the conversation; `binary=false` (default) applies CP/M's CRLF + EOF-marker convention for text. |
+| `rc2014_download` | Board file → content inline (base64 when `binary=true`), sha256. Prefer `rc2014_download_file`. |
 | `rc2014_read_text_file` | Read text via `TYPE` — no transfer needed. |
 | `rc2014_scan_drives` | Catalogue every mapped drive with filenames (slow; reports progress). Current user area only. |
 | `rc2014_survey` | Run RomWBW's `SURVEY`: per-drive totals across **all** user areas, memory map, BIOS/BDOS addresses, TPA, active I/O ports. One ~7s command. |
@@ -325,16 +329,29 @@ Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so
 clients can auto-approve the safe ones and prompt for reboots and writes.
 Long operations report progress as they run.
 
+**ZMD quirk:** every ZMD exit on this board cold-starts it (RomWBW banner +
+autoboot back to the OS, ~11 s). That's expected — the YMODEM batch tools
+wait it out and verify afterwards, so a reboot right after a batch transfer
+is normal, not a crash. The GUI's Transfer menu also has "Send/Receive Files
+(YMODEM Batch)" (F10/F11) driving the same composites.
+
 `rc2014_run_command` deliberately times out on anything that doesn't return
 to a shell prompt — MBASIC, `ED`, the `Boot [H=Help]:` menu. Use
 `rc2014_send_text` plus `rc2014_get_screen` for those.
+
+On **ZPM3** (ZCPR/CP/M+), classic `STAT`, `ERA`, and `DIR <user>:` do not
+work. Prefer **`SDZ`** (`SDZ A1:`, `SDZ A1:FILE.COM`) and **`ERASE`** after
+selecting drive/user. The bridge auto-translates `STAT <target>` → `SDZ
+<target>` and rejects bare `STAT` with a hint instead of sending `STAT ?` to
+the board. See [`CHANGELOG.md`](CHANGELOG.md) (2026-08-29).
 
 ### Resources and prompts
 
 - `rc2014://docs/hardware-overview` — this machine's configuration,
   rendered from the boot banner the bridge actually captured rather than a
   hardcoded description.
-- `rc2014://docs/cpm-guide` — CP/M 2.2 / ZSDOS command reference.
+- `rc2014://docs/cpm-guide` — CP/M 2.2 / ZSDOS / **ZPM3** command reference
+  (`SDZ`, `ERASE`; not `STAT` on ZPM3).
 - `rc2014://system/hardware-info` — the same hardware data as JSON.
 - `rc2014_assistant_instructions` — prompt template for operating the machine.
 
@@ -342,9 +359,9 @@ to a shell prompt — MBASIC, `ED`, the `Boot [H=Help]:` menu. Use
 
 **The MCP port has no authentication.** Anything that can reach
 `0.0.0.0:8014` can run commands on the board, reboot it, and read or write
-any file on any mapped drive (`rc2014_upload`/`rc2014_download` take content
-directly, not a host path, but that's still full read/write access to the
-board's storage). That's a deliberate trade for a tool on a trusted private
+any file on any mapped drive — and, via `rc2014_upload_file`/
+`rc2014_download_file`, read and write arbitrary files on the **host**
+filesystem too. That's a deliberate trade for a tool on a trusted private
 network. If the machine running the bridge is on a network you don't
 control, pass `--mcp-host 127.0.0.1` and reach it through an SSH tunnel.
 

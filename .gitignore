@@ -8,4 +8,6 @@ __pycache__/
 *.log
 hardware_info.json
 rc2014bridge.ini
+HANDOVER.md
+PR_BODY.md
 .vscode/

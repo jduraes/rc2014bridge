@@ -27,10 +27,15 @@ command's output. Do not send a command and then poll `rc2014_get_screen` —
 that was the old pattern and it cost 3-5 calls per command.
 
 ```
-rc2014_run_command(command="DIR A:")
--> {"ok": true, "output": "A: LEDSHOW  COM : TEST     TXT", "prompt": "A>",
+rc2014_run_command(command="SDZ A1:")
+-> {"ok": true, "output": "A: LEDSHOW  COM : TEST     TXT", "prompt": "A1>",
     "state": "cpm", "duration_s": 1.2, "timed_out": false}
 ```
+
+On **ZPM3** (this machine's usual OS): never use `STAT`, `ERA`, or `DIR <user>:`.
+Use **`SDZ`** for listings and free space (`SDZ A1:`, `SDZ A1:FILE.COM`).
+Use **`ERASE`** after `A1:` instead of `ERA`. The bridge translates `STAT <target>`
+to `SDZ <target>` automatically; bare `STAT` is rejected with a hint.
 
 `timeout` defaults to 15s. A long-running program needs a longer one.
 
@@ -157,64 +162,87 @@ instead of going through `C`/`Z` first.
 
 ## File transfer
 
-`rc2014_upload` and `rc2014_download` are content in, content out — no host
-file path involved. **Do not run `XM` yourself first**; both tools handle the
-whole sequence internally, and getting the drive/user prefixes right by hand
-is error-prone.
-
-**`name` is a bare 8.3 filename, never `"B:HELLO.TXT"`.** This breaks from
-every other tool here (`rc2014_read_text_file`, `rc2014_run_command`, ...),
-which all take one combined `cpm_path`/command string with the drive baked
-in. These two split it: drive and user area are separate parameters.
+**Default: `rc2014_upload_file` / `rc2014_download_file`.** They take host
+paths — the bridge reads/writes the file itself, so **no file content ever
+crosses MCP**. Never inline a file that exists on disk into a tool call; that
+wastes tokens and (worse, for binary) base64-inflates it by a third.
 
 ```
-rc2014_upload(name="HELLO.TXT", drive="B", content="line one\nline two\n")
--> {"ok": true, "target": "B:HELLO.TXT", "existed_before": false,
-    "bytes_raw": 20, "bytes_wire": 132, "compressed": true,
-    "verified": true, "sha256": "..."}
+rc2014_upload_file(host_path="Z:\\src\\HELLO.TXT", drive="B")
+-> {"ok": true, "target": "B:HELLO.TXT", "host_path": "Z:\\src\\HELLO.TXT",
+    "bytes_raw": 20, "compressed": false, "verified": true, "sha256": "..."}
 
-rc2014_download(name="HELLO.TXT", drive="B")
--> {"ok": true, "target": "B:HELLO.TXT", "content": "line one\nline two\n",
-    "binary": false, "bytes_raw": 20, "sha256": "..."}
+rc2014_download_file(name="HELLO.TXT", drive="B", dest_path="Z:\\out\\HELLO.TXT")
+-> {"ok": true, "target": "B:HELLO.TXT", "dest_path": "Z:\\out\\HELLO.TXT",
+    "bytes_raw": 128, "sha256": "..."}
 ```
 
-Both require an OS to be running (`state=cpm`). `upload` always zips the
-content and `UNZIP`s it on the board — a whole-file CRC check on the way in,
-essentially free at these sizes. `download` always uses XMODEM's 1K-block
-mode (`XM SK`), since that only exists on the board's send verb and download
-is the direction where the board sends.
+`upload_file` sends the host bytes **verbatim** — no zip staging, no CRLF/EOF
+transcoding; the final 128-byte XMODEM block is `0x1A`-padded, which doubles
+as the CP/M text EOF marker. `name` defaults to the host basename uppercased
+(must be valid 8.3). `download_file` writes verbatim too, so the file may
+carry `0x1A` padding past the logical end (CP/M's 128-byte records store no
+sub-record length). `dest_path` defaults to the CP/M filename in the bridge's
+working directory and is overwritten without asking.
 
-`binary=false` (the default, both directions) applies CP/M's CRLF +
-trailing-`0x1A`-EOF-marker convention for text, matching what `TYPE` and
-other tools expect — and encodes as **latin-1**: an em-dash, curly quotes, or
-anything else outside that charset is silently replaced with `?` on upload,
-with no error. Confirmed the hard way, sending this very file's README
-through it. Use `binary=true` (base64) for any content that has to survive
-exactly.
+`rc2014_upload` / `rc2014_download` (inline `content`, base64 when
+`binary=true`) still exist — use them **only** for content that lives in the
+conversation itself and has no host file. `upload` zips and `UNZIP`s on the
+board (whole-file CRC); `binary=false` does CRLF + `0x1A` EOF text conversion
+and latin-1 encoding (anything outside latin-1 silently becomes `?`).
 
-`binary=true` passes raw bytes through untouched (`content` is base64 on the
-way in and out) — but is only byte-exact to the file's 128-byte CP/M record
-size, confirmed against real hardware. CP/M has no sub-record length anywhere
-in the filesystem (`STAT` only ever reports whole records), so a binary file
-whose true length isn't a multiple of 128 can come back with trailing
-padding. That's what the CRLF/EOF convention exists to solve for text;
-there's no equivalent for arbitrary binary data.
+**Batch (YMODEM): `rc2014_upload_files` / `rc2014_download_files`.** Prefer
+these whenever more than one file moves: a single arming of ZMD covers the
+whole batch and blocks are 1K in both directions.
+
+```
+rc2014_upload_files(host_paths=["Z:\\src\\HELLO.TXT", "Z:\\src\\GAME.COM"], drive="A", user=1)
+rc2014_download_files(names=["HELLO.TXT", "GAME.COM"], drive="A", user=1, dest_dir="Z:\\out")
+```
+
+Board names are the host basenames uppercased (each must be valid 8.3; a
+batch with two files mapping to the same name is rejected). All existence
+checks happen before anything is armed: `overwrite=false` fails the whole
+batch if any target exists, and downloads fail if any source is missing.
+Both switch the board to the target drive/user first and restore it after.
+`download_files` sends one `zmd sb <names...>` command — the `B` forces batch
+mode, so even a single file gets a block-0 header (plain `zmd s <one-file>`
+silently falls back to XMODEM-1K single-file mode and sends none, which made
+one-file batch downloads die with "sender cancelled transfer"). CP/M's
+~127-char command line caps how many names fit in a batch. **Do not run `ZMD`
+yourself first.**
+
+Two ZMD realities to plan around (live-tested against ZMD 1.50):
+
+- **Every ZMD exit cold-starts this board** — RomWBW banner, hardware
+  probe, autoboot back to ZPM3, ~11 s total. That is expected, **not a
+  crash**; the batch tools wait it out before verifying and restoring the
+  drive/user. Don't type anything while a ZMD transfer is settling.
+- **Download sizes are 1K-rounded in ZMD's headers** (CP/M knows only
+  128-byte record counts), so `strip_padding` matters: `true` (default)
+  also strips trailing `0x1A` — right for text. Pass `strip_padding=false`
+  for byte-exact binary, where CP/M's record granularity still applies
+  (same convention as `rc2014_download_file`).
+
+**Do not run `XM` yourself first**; all four tools handle the whole sequence
+internally. **`name` is a bare 8.3 filename, never `"B:HELLO.TXT"`** — drive
+and user area are separate parameters, unlike the `cpm_path`-style tools.
+
+Both directions require an OS (`state=cpm`). `overwrite=false` (the default)
+fails rather than replacing an existing target; `overwrite=true` erases first
+and reports `replaced_existing`. Uploads to the ROM disk (`MD1`, usually `C:`)
+always fail — it is read-only. `user` (0-15) addresses a CP/M user area
+directly, e.g. `drive="A", user=1` reaches `A1:` without a separate `USER`
+command.
 
 The download result's `block_size` only reflects the *last* block received,
 not the whole transfer — RomWBW's sender drops to 128-byte blocks for a short
 tail even when the bulk of the file went over in 1K blocks. Don't read it as
 "1K blocks didn't happen" just because it says 128.
 
-`UNZIP` won't replace an existing file any more than `XM` will, so
-`rc2014_upload` erases the target first when `overwrite=true` and reports
-`replaced_existing`; the default is `overwrite=false` (fails instead of
-replacing). Uploads to the ROM disk (`MD1`, usually `C:`) always fail — it is
-read-only. `user` (0-15) addresses a CP/M user area directly, e.g.
-`drive="A", user=1` reaches `A1:` without a separate `USER` command.
-
 For a quick text peek without a transfer, `rc2014_read_text_file` uses `TYPE`
 — cheaper, but **not byte-exact**: tabs are expanded and reading stops at the
-0x1A EOF marker. Use `rc2014_download` when the exact bytes matter.
+0x1A EOF marker. Use `rc2014_download_file` when the exact bytes matter.
 
 ## System information
 
@@ -232,6 +260,9 @@ For a quick text peek without a transfer, `rc2014_read_text_file` uses `TYPE`
   seconds. For one drive, `rc2014_run_command("DIR B:")` is far faster.
 
 ### User areas matter here
+
+`DIR <drive>:` (e.g. `DIR C:`) works fine in ZPM3. What fails is `DIR` with a
+user area (`DIR C0:`) — for those, use `SDZ` (e.g. `SDZ C0:`).
 
 `DIR` — and therefore `rc2014_scan_drives` — only lists the **current CP/M user
 area**. On this system `A:` shows 50 files in user 0 but holds 210 in total (a

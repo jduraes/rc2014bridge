@@ -156,6 +156,44 @@ class TestToolCalls(unittest.TestCase):
             "rc2014_download", {"name": "X.COM", "drive": "B"}))
         link.download.assert_called_once_with("X.COM", "B", user=0, binary=False)
 
+    def test_upload_file_forwards_defaults(self):
+        server, link = _server()
+        link.upload_file.return_value = {"ok": True, "verified": True}
+
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_upload_file", {"host_path": "Z:\\src\\X.COM", "drive": "B"}))
+        link.upload_file.assert_called_once_with(
+            "Z:\\src\\X.COM", "B", user=0, name=None, overwrite=False)
+
+    def test_upload_file_forwards_all_parameters(self):
+        server, link = _server()
+        link.upload_file.return_value = {"ok": True}
+
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_upload_file", {"host_path": "/tmp/blob.bin", "drive": "A",
+                                   "user": 1, "name": "BLOB.BIN", "overwrite": True}))
+        link.upload_file.assert_called_once_with(
+            "/tmp/blob.bin", "A", user=1, name="BLOB.BIN", overwrite=True)
+
+    def test_download_file_forwards_defaults(self):
+        server, link = _server()
+        link.download_file.return_value = {"ok": True}
+
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_download_file", {"name": "X.COM", "drive": "B"}))
+        link.download_file.assert_called_once_with("X.COM", "B", user=0,
+                                                   dest_path=None)
+
+    def test_download_file_forwards_dest_path(self):
+        server, link = _server()
+        link.download_file.return_value = {"ok": True}
+
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_download_file", {"name": "X.COM", "drive": "B", "user": 2,
+                                     "dest_path": "Z:\\out\\X.COM"}))
+        link.download_file.assert_called_once_with("X.COM", "B", user=2,
+                                                   dest_path="Z:\\out\\X.COM")
+
 
 class TestHardwareDoc(unittest.TestCase):
     def test_doc_is_rendered_from_captured_info(self):

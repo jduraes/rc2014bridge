@@ -94,9 +94,30 @@ BOOT_SETTLE_TIMEOUT = 20.0
 # CP/M prompts carry the user area when it isn't 0, and the two orderings both
 # occur in the wild: "2A>" and - on RomWBW/ZSDOS - "C2>". Accept either, or every
 # command run outside user area 0 waits out its timeout.
-_CPM = r"[0-9]*[A-P][0-9]*>"
+# ZPM3 (Simeon Cran ZCPR for CP/M+) adds a clock prefix and an optional named
+# directory - "11:26 J1>", "13:47 A0:SYSTEM>" - and wraps segments in ANSI bold
+# escapes ("\x1b[1m" / "\x1b[m") which survive into the raw receive log that
+# run_command() matches against. The escape runs and the prefix are all
+# optional, so the plain ZSDOS forms keep matching unchanged.
+_ANSI_M = r"(?:\x1b\[[0-9;]*m)"
+_CPM = (rf"{_ANSI_M}*(?:\d{{1,2}}:\d{{2}}{_ANSI_M}*\s+)?{_ANSI_M}*"
+        rf"[0-9]*[A-P][0-9]*(?::[A-Za-z0-9]+)?{_ANSI_M}*>")
 _HBIOS = r"HBIOS>|Boot(?:\s*\[[^\]]*\])?\s*:"
 _FLASH = r"FDU>|FLASH>|Command\?"
+
+# ZPM3 tells: a clock prefix at the very start of the prompt ("15:21 J1>"),
+# or a named directory ("A0:SYSTEM>"). The clock MUST be anchored - an
+# unanchored \d\d:\d\d matches incidental text (STAT output, timestamps in
+# file listings) and misflags plain CP/M as ZPM3.
+_ZPM3_CLOCK_RE = re.compile(rf"^{_ANSI_M}*\d{{1,2}}:\d{{2}}{_ANSI_M}*\s")
+_ZPM3_NAMED_RE = re.compile(r"[A-P][0-9]*:[A-Za-z0-9]+>")
+
+# Strings that only ever appear at the start of a fresh boot - used by
+# _update_system_state() to drop stale OS-flavor state. "RomWBW HBIOS v" is
+# the RomWBW firmware banner; SC126-class boards never print it, so their
+# loader banner ("... Boot Loader") and the "CBIOS v" line every CP/M-flavor
+# boot prints serve as markers there too.
+_NEW_BOOT_MARKERS = ("RomWBW HBIOS v", "Boot Loader", "CBIOS v")
 
 CPM_PROMPT_RE = re.compile(rf"^{_CPM}")
 # Looser: the boot banner's "A:=IDE0:0" drive-configuration lines also mean
@@ -113,6 +134,12 @@ TRAILING_PROMPT_RE = re.compile(
     rf"(?:^|[\r\n])[ \t]*({_CPM}|(?i:{_HBIOS})|(?i:{_FLASH}))[ \t]*\Z"
 )
 PROMPT_ONLY_RE = re.compile(rf"^(?:{_CPM}|(?i:{_HBIOS})|(?i:{_FLASH}))[ \t]*$")
+
+# Extract a "A1:"-style drive/user out of a prompt string. Both orderings
+# occur in the wild ("2A>" classic CP/M, "C2>" RomWBW/ZSDOS), and ZPM3 may
+# add a clock prefix or a named directory, all of which this ignores.
+_DU_FROM_PROMPT_RE = re.compile(
+    r"(?:(\d{1,2})([A-P])|([A-P])(\d{0,2}))(?:\s*:[A-Za-z0-9]+)?\s*>\s*$")
 
 # SUBMIT echoes each line it is about to run as "<drive>$<command>", e.g.
 # "A$LDTIM". Seeing that means a startup script is mid-flight, and ANY console
@@ -162,6 +189,10 @@ XM_ERROR_RE = re.compile(
 
 # How long to watch XM after its banner to see whether it bails out.
 XM_ARM_SETTLE = 2.0
+
+# ZMD's exit can pause at a "-- Hit a key" prompt, waiting for a keypress
+# before it returns to the OS. _settle_after_zmd releases it with a CR.
+ZMD_HIT_A_KEY_RE = re.compile(r"hit a key", re.IGNORECASE)
 
 # Named keys accepted by send_keys(), for characters that can't be typed into a
 # JSON string safely or legibly.
@@ -255,6 +286,17 @@ def _parse_stat_free_space(text: str) -> int | None:
     return int(m.group(1)) * 1024 if m else None
 
 
+_SDZ_FREE_SPACE_RE = re.compile(r"Free:\s*(\d+)k", re.IGNORECASE)
+
+
+def _parse_sdz_free_space(text: str) -> int | None:
+    """Bytes free from ZPM3 SDZ's 'Free: 248k' trailer. ZPM3's STAT has no
+    drive-space form ('STAT B:' just errors), so SDZ - which already prints
+    free space on every listing - is the source there."""
+    m = _SDZ_FREE_SPACE_RE.search(text)
+    return int(m.group(1)) * 1024 if m else None
+
+
 _STAT_FILE_INFO_RE = re.compile(r"^\s*(\d+)\s+(\d+)k\s+\d+\s+\S+", re.MULTILINE)
 
 
@@ -263,6 +305,59 @@ def _parse_stat_file_info(text: str) -> dict:
     ' Recs  Bytes  Ext Acc\\n   10     4k    1 R/W J:MANDEL.COM'."""
     m = _STAT_FILE_INFO_RE.search(text)
     return {"records": int(m.group(1)), "bytes": int(m.group(2)) * 1024} if m else {}
+
+
+_ZPM3_DU_PREFIX_RE = re.compile(r"^[A-P]\d", re.IGNORECASE)
+
+
+def _prepare_cpm_command(command: str, zpm3: bool) -> dict:
+    """Normalize classic CP/M commands for ZPM3/ZCPR dialect before they hit the wire."""
+    if not zpm3:
+        return {"send": command, "blocked": None, "translated_from": None}
+
+    stripped = command.strip()
+    if not stripped:
+        return {"send": command, "blocked": None, "translated_from": None}
+
+    upper = stripped.upper()
+
+    if upper == "STAT":
+        return {
+            "send": None,
+            "blocked": (
+                "STAT is not available on ZPM3. Use SDZ <drive>: for drive free space "
+                "(e.g. SDZ A1:), or SDZ <du>:<file> to list/check a file."
+            ),
+            "translated_from": stripped,
+        }
+
+    if upper.startswith("STAT "):
+        rest = stripped[4:].strip()
+        translated = f"SDZ {rest}"
+        return {"send": translated, "blocked": None, "translated_from": stripped}
+
+    if upper.startswith("DIR "):
+        rest = stripped[4:].strip()
+        if _ZPM3_DU_PREFIX_RE.match(rest):
+            translated = f"SDZ {rest}"
+            return {"send": translated, "blocked": None, "translated_from": stripped}
+
+    if upper.startswith("ERA ") or upper == "ERA":
+        rest = stripped[3:].strip() if upper.startswith("ERA ") else ""
+        if ":" in rest:
+            du, bare = rest.split(":", 1)
+            return {
+                "send": None,
+                "blocked": (
+                    f"ERA is not available on ZPM3. Use two commands: '{du}:' then "
+                    f"'ERASE {bare}'."
+                ),
+                "translated_from": stripped,
+            }
+        translated = f"ERASE {rest}" if rest else "ERASE"
+        return {"send": translated, "blocked": None, "translated_from": stripped}
+
+    return {"send": command, "blocked": None, "translated_from": None}
 
 
 def _parse_keys(keys: str) -> list[tuple[str, object]]:
@@ -431,6 +526,11 @@ def _parse_zsdos_banner(text: str) -> dict:
     if m:
         info["tpa"] = m.group(1)
 
+    # Plain DRI CP/M announces itself too: "CP/M-80 v2.2, 54.0K TPA".
+    m = re.search(r"CP/M-80\s+(v[0-9.]+)", text, re.IGNORECASE)
+    if m:
+        info["cpm_version"] = f"CP/M-80 {m.group(1)}"
+
     drives = {}
     for line in text.splitlines():
         line_s = line.strip()
@@ -440,6 +540,16 @@ def _parse_zsdos_banner(text: str) -> dict:
     if drives:
         info["drive_mappings"] = drives
     return info
+
+
+def _parse_zpm3_banner(text: str) -> dict:
+    """ZPM3 announces itself at boot, e.g. 'ZPM3 [BANKED] for HBIOS
+    v3.7.0-dev.12' - no ZSDOS/CBIOS strings appear on that path, so without
+    this a ZPM3 machine's OS is never captured into hardware_info."""
+    m = re.search(r"ZPM3\s+(?:\[\w+\]\s+)?for\s+HBIOS\s+(v[\w.\-]+)", text, re.IGNORECASE)
+    if not m:
+        return {}
+    return {"zpm3_version": f"ZPM3 for HBIOS {m.group(1)}"}
 
 
 def _parse_survey_output(text: str) -> dict:
@@ -516,21 +626,44 @@ def _parse_stat_output(text: str) -> dict:
 
 
 def _parse_cpm_dir_output(text: str) -> list[str]:
+    # SDZ bolds the first letter of the file type for files with attributes
+    # (RO/SYS) - "ASM     .\x1b[1mC\x1b[mOM   8k". Left in place, the escape
+    # sequences break the extension match and every attributed file vanishes
+    # (seen on hardware: the all-RO ROM disk scanned as 0 files).
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
     files = []
     ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "STAT"}
     for line in text.splitlines():
         line_clean = re.sub(r"^[A-P]>", "", line.strip())
-        if "No File" in line_clean or "NO FILE" in line_clean or "Space:" in line_clean:
+        if "No File" in line_clean or "NO FILE" in line_clean or "Space:" in line_clean \
+                or "no detectable" in line_clean.lower():
             continue
         parts = re.split(r"[|:]", line_clean)
         for part in parts:
-            p_str = part.strip()
-            if not p_str:
-                continue
-            m = re.match(r"^([A-Z0-9_\$]{1,8})\s+\.?\s*([A-Z0-9_\$]{1,3})$", p_str, re.IGNORECASE)
-            if m:
-                name, ext = m.group(1).upper(), m.group(2).upper()
-                if name not in ignored:
+            # DIR prints column pairs ("ZPATH    COM : STAT     COM"); SDZ
+            # (ZPM3) pads names to 8 chars with spaces and keeps the dot with
+            # the extension ("180FIG  .COM"), collapsing to "ZPATH.COM" only
+            # when the name is already 8 chars - so the extension token may
+            # or may not carry its dot.
+            tokens = part.split()
+            i = 0
+            while i < len(tokens):
+                m = re.match(r"^([A-Z0-9_\$]{1,8})\.([A-Z0-9_\$]{1,3})$", tokens[i], re.IGNORECASE)
+                if m:
+                    name, ext = m.group(1).upper(), m.group(2).upper()
+                    i += 1
+                elif (i + 1 < len(tokens)
+                        and re.fullmatch(r"[A-Z0-9_\$]{1,8}", tokens[i], re.IGNORECASE)
+                        and re.fullmatch(r"\.?[A-Z0-9_\$]{1,3}", tokens[i + 1], re.IGNORECASE)):
+                    name, ext = tokens[i].upper(), tokens[i + 1].upper().lstrip(".")
+                    i += 2
+                else:
+                    i += 1
+                    continue
+                # A bare size/records token ("16k", "128") is not a filename:
+                # ZSDOS DIR's "ART TXT 16k 128" columns would otherwise pair
+                # into phantom "16K.128" entries.
+                if name not in ignored and not re.fullmatch(r"\d+K?", name):
                     fname = f"{name}.{ext}"
                     if fname not in files:
                         files.append(fname)
@@ -633,7 +766,15 @@ class SerialLink:
                  hw_info_file: str = "hardware_info.json",
                  text_pacing: tuple[int, float] = None,
                  xmodem_pacing: tuple[int, float] = None,
-                 rtscts: bool = False):
+                 rtscts: bool = False,
+                 xm_command: str = "",
+                 zmd_command: str = "",
+                 pixel_stream: bool = True):
+        # Windows accepts COMn in any case but enumerates it uppercase;
+        # normalize so the status bar/dropdown don't show "com10" and
+        # case-mismatched port strings never reach the same-port checks.
+        if os.name == "nt" and re.fullmatch(r"(?i)com\d+", port):
+            port = port.upper()
         self.port = port
         self.baud = baud
         # The board's "resting" rate - what --baud/the config file say it
@@ -643,13 +784,22 @@ class SerialLink:
         # _check_for_baud_mismatch() has something stable to fall back to
         # if the board resets back to its power-on rate mid-session.
         self._default_baud = baud
+        # Optional override for the XM invocation used by upload()/download()
+        # (e.g. "XM" to use the current drive's copy instead of the ROM disk's).
+        self._xm_command_override = xm_command
+        # Same for ZMD, the YMODEM batch program used by upload_files()/
+        # download_files().
+        self._zmd_command_override = zmd_command
         self._garbage_streak = 0
         self._last_garbage_recovery_at = 0.0
         self.cols, self.rows = cols, rows
         self.hw_info_file = hw_info_file
+        # timeout=0.02 (not the usual 0.1): the read loop drains in_waiting
+        # and only blocks briefly for 1 byte, so output streams smoothly
+        # instead of arriving in 100ms lumps.
         try:
             self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
-                                       stopbits=1, timeout=0.1, rtscts=rtscts)
+                                       stopbits=1, timeout=0.02, rtscts=rtscts)
         except (serial.SerialException, OSError) as e:
             logger.warning("Could not open serial port %r: %s - starting "
                             "disconnected; use Connection Settings to pick "
@@ -678,6 +828,10 @@ class SerialLink:
         # until a new render starts or the user explicitly switches back,
         # not vanish the moment decoding finishes.
         self._show_pixel_view = False
+        # When False, the reader never auto-switches to pixel_stream mode:
+        # a stray 0xFA on the wire (serial noise at reset, binary file
+        # output) must not eat the console. Manual pixel view still works.
+        self._pixel_stream_enabled = pixel_stream
         self._xmodem_q: "queue.Queue[int]" = queue.Queue()
         self._pixel_decoder = PixelStreamDecoder()
 
@@ -703,7 +857,28 @@ class SerialLink:
         # confirmation is seen and the bridge has followed suit - see
         # _update_system_state()/_follow_hbios_baud_change().
         self._pending_hbios_baud: int | None = None
+        # ZPM3 (ZCPR/CP/M+) cannot DIR user areas - use SDZ there instead.
+        # Seeded from the persisted banner info below, so a bridge that starts
+        # with the machine already sitting at a ZPM3/NZ-COM/Z3PLUS prompt (no
+        # boot banner seen by this process) still speaks the right dialect;
+        # the new-boot marker handler clears it again on the next boot.
+        self._zpm3 = False
+        # Which OS environment is actually up, for the badge: set from boot
+        # banners (latest one wins, so layered environments like ZSDOS->NZ-COM
+        # or CP/M3->Z3PLUS end on the outermost layer), falling back to the
+        # ZCPR3 prompt shape. Seeded from the persisted banner info below, so
+        # attaching to an already-running session still badges correctly.
+        self._os_env = None
         self.hardware_info = self._load_hardware_info()
+        if self.hardware_info.get("zpm3_version"):
+            self._zpm3 = True
+            self._os_env = "zpm3"
+        elif self.hardware_info.get("nzcom_version"):
+            self._zpm3 = True
+            self._os_env = "nzcom"
+        elif self.hardware_info.get("z3plus_version"):
+            self._zpm3 = True
+            self._os_env = "z3plus"
 
         # An explicit setting wins; otherwise reuse whatever calibrate_pacing()
         # last proved on this machine, falling back to the safe defaults.
@@ -715,6 +890,15 @@ class SerialLink:
         logger.info("Write pacing: text=%s xmodem=%s", self.text_pacing, self.xmodem_pacing)
         self._hw_snapshot = json.dumps(self.hardware_info, sort_keys=True)
         self._boot_buffer = ""
+        # Boot-marker detection state: the banner can straddle two reads, so
+        # _update_system_state() searches the accumulated buffer and uses this
+        # absolute position to fire exactly once per banner occurrence.
+        self._rx_bytes_total = 0
+        self._last_marker_fired_at = -1
+        # Half-received console line, kept across read chunks so prompt/state
+        # detection sees whole lines - the read loop drains in_waiting, so a
+        # prompt typically arrives in several small pieces.
+        self._rx_linebuf = ""
 
         # Bumped by reconfigure() each time it swaps in a freshly opened
         # _ser. _read_loop compares against this to tell "port was closed
@@ -811,6 +995,23 @@ class SerialLink:
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+    def _merge_hw_info(self, parsed: dict):
+        """Merge parsed banner fields into hardware_info, saving on change.
+
+        The banner parsers run on every received chunk (their triggers look at
+        the accumulated boot region, immune to reads splitting a keyword), so
+        compare field-by-field and only touch the dict - and the JSON file -
+        when a value actually changes. "timestamp" rides along on real changes
+        but never triggers one by itself.
+        """
+        new = {k: v for k, v in parsed.items() if v and k != "timestamp"}
+        if not any(self.hardware_info.get(k) != v for k, v in new.items()):
+            return
+        if parsed.get("timestamp"):
+            new["timestamp"] = parsed["timestamp"]
+        self.hardware_info.update(new)
+        self._save_hardware_info()
+
     def _save_hardware_info(self):
         # The reader thread calls this on every chunk that looks like a banner
         # line, so skip the write unless something actually changed.
@@ -840,8 +1041,17 @@ class SerialLink:
         return ""
 
     def _xm_command(self) -> str:
+        if self._xm_command_override:
+            return self._xm_command_override
         rom = self._rom_disk_drive()
         return f"{rom}:XM" if rom else "XM"
+
+    def _zmd_command(self) -> str:
+        # Unlike XM (ROM-disk resident, so it gets a drive prefix), ZMD is
+        # invoked bare - boards keep it wherever their search path finds it.
+        if self._zmd_command_override:
+            return self._zmd_command_override
+        return "ZMD"
 
     @_exclusive("reboot")
     def reboot(self) -> dict:
@@ -922,11 +1132,17 @@ class SerialLink:
             return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
 
         mapped = self.hardware_info.get("drive_mappings", {})
+        if self._zpm3:
+            # ZPM3 can re-map letters after boot (ASSIGN) - the persisted map
+            # is the boot-time one and may be stale by now. Refresh from the
+            # live system first; keep the persisted map if ASSIGN can't be read.
+            mapped = self._current_drive_mappings() or mapped
         drives_to_scan = list(mapped.keys()) if mapped else ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
         self._scan_progress = {"active": True, "drive": "", "index": 0,
                                "total": len(drives_to_scan) + 1}
         listings: dict[str, list[str]] = {}
+        zpm3_free: dict[str, str] = {}
         try:
             # DIR every drive *first*. CP/M's STAT only reports drives that have
             # been logged in, and a DIR is what logs one in - so asking STAT
@@ -937,20 +1153,36 @@ class SerialLink:
                 self._scan_progress.update({"drive": f"{drv}:", "index": position})
                 # run_command already isolates this command's output, so there's
                 # no need to fish the DIR block back out of the screen history.
-                listing = self.run_command(f"DIR {drv}:", timeout=DIR_TIMEOUT)
+                # nudge_after: ZSDOS/ZPM3 page long listings by CRT height and
+                # then wait for a keystroke with no visible marker - without
+                # nudges a full drive comes back as just its first page.
+                listing = self.run_command(self._dir_command(f"{drv}:"),
+                                           timeout=DIR_TIMEOUT, nudge_after=1.0)
                 listings[drv] = _parse_cpm_dir_output(listing.get("output", ""))
+                if self._zpm3:
+                    # ZPM3's STAT has no drive-space form (bare "STAT" errors
+                    # with "STAT ?"), but every SDZ listing ends with a
+                    # "Free: Nk" trailer - capacities come from there instead.
+                    free = _parse_sdz_free_space(listing.get("output", ""))
+                    if free is not None:
+                        zpm3_free[drv] = f"{free // 1024}k"
 
-            self._scan_progress.update({"drive": "STAT", "index": len(drives_to_scan) + 1})
-            # STAT probes every logged-in drive before printing, so it is
-            # genuinely slow - ~6s for ten drives. Don't race it.
-            stat = self.run_command("STAT", timeout=STAT_TIMEOUT)
-            stat_data = _parse_stat_output(stat.get("output", ""))
-            if not stat_data:
-                # If STAT still outran its timeout, salvage whatever reached the
-                # screen rather than reporting every capacity as unknown.
-                logger.warning("STAT output not parseable (timed_out=%s); falling back to screen history",
-                               stat.get("timed_out"))
-                stat_data = _parse_stat_output(self._get_full_screen_history_text())
+            stat_data: dict = {}
+            if self._zpm3:
+                stat_data = {d: {"access": "", "free_space": v}
+                             for d, v in zpm3_free.items()}
+            else:
+                self._scan_progress.update({"drive": "STAT", "index": len(drives_to_scan) + 1})
+                # STAT probes every logged-in drive before printing, so it is
+                # genuinely slow - ~6s for ten drives. Don't race it.
+                stat = self.run_command("STAT", timeout=STAT_TIMEOUT)
+                stat_data = _parse_stat_output(stat.get("output", ""))
+                if not stat_data:
+                    # If STAT still outran its timeout, salvage whatever reached the
+                    # screen rather than reporting every capacity as unknown.
+                    logger.warning("STAT output not parseable (timed_out=%s); falling back to screen history",
+                                   stat.get("timed_out"))
+                    stat_data = _parse_stat_output(self._get_full_screen_history_text())
         finally:
             self._scan_progress = {"active": False, "drive": "", "index": 0, "total": 0}
 
@@ -1055,6 +1287,8 @@ class SerialLink:
         with open(src, "wb") as f:
             f.write(payload)
         back = src + ".back"
+        # upload()/download() take inline content now, not host paths.
+        encoded = base64.b64encode(payload).decode("ascii")
 
         original = self.xmodem_pacing
         attempts = []
@@ -1066,16 +1300,17 @@ class SerialLink:
                 # dominated by fixed costs - XM startup, the handshake poke wait,
                 # the mode-switch settles - which mask the difference between
                 # pacing settings and understate the real gain.
-                started = time.time()
-                up = self.upload(src, dest_drive=drive, cpm_name="PACETEST.BIN", verify=False)
-                send_seconds = time.time() - started
+                started = time.perf_counter()
+                up = self.upload("PACETEST.BIN", drive, content=encoded,
+                                 binary=True, overwrite=True)
+                send_seconds = time.perf_counter() - started
                 if not up.get("ok"):
                     attempts.append({"chunk": chunk, "delay": delay, "ok": False,
                                      "error": up.get("error", "upload failed")})
                     logger.info("Pacing %s/%.3fs failed on upload: %s", chunk, delay, up.get("error"))
                     break
 
-                down = self.download(f"{drive}PACETEST.BIN", local_path=back)
+                down = self.download("PACETEST.BIN", drive, binary=True)
                 matched = down.get("ok") and down.get("sha256") == expected
                 attempts.append({"chunk": chunk, "delay": delay, "ok": bool(matched),
                                  "send_seconds": round(send_seconds, 1),
@@ -1089,7 +1324,7 @@ class SerialLink:
                             chunk, delay, send_seconds, test_bytes)
         finally:
             self.xmodem_pacing = best or original
-            self.run_command(f"ERA {drive}PACETEST.BIN", timeout=DIR_TIMEOUT)
+            self._erase(f"{drive}PACETEST.BIN")
             for path in (src, back):
                 if os.path.exists(path):
                     os.unlink(path)
@@ -1160,6 +1395,18 @@ class SerialLink:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def probe_connection(self, port: str, baud: int, rtscts: bool = False) -> dict:
+        """Settings-screen probe that also works for the port this link is
+        already holding: an open port is its own proof of openability, and
+        Windows refuses a second open of the same COM port
+        (PermissionError 13), so the independent probe_serial_connection()
+        would always fail against our own port there."""
+        # normcase: Windows reports enumerated ports uppercase while the
+        # config file may say "com10" - the same physical port either way.
+        if os.path.normcase(port) == os.path.normcase(self.port) and self._ser.is_open:
+            return {"ok": True, "already_connected": True}
+        return probe_serial_connection(port, baud, rtscts)
+
     @_exclusive("reconfigure connection")
     def reconfigure(self, port: str = None, baud: int = None, rtscts: bool = None,
                      is_default_change: bool = True) -> dict:
@@ -1179,13 +1426,56 @@ class SerialLink:
         new_port = self.port if port is None else port
         new_baud = self.baud if baud is None else baud
         new_rtscts = self._ser.rtscts if rtscts is None else rtscts
-        try:
-            new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
-                                     stopbits=1, timeout=0.1, rtscts=new_rtscts)
-        except (serial.SerialException, OSError) as e:
+        # normcase: Windows enumerates ports uppercase ("COM10") while the
+        # config file may say "com10" - a case-sensitive comparison here
+        # skipped the close and the reopen then failed with PermissionError
+        # 13 (a second open of a port we already hold), leaving the old
+        # connection running and the user thinking the change was applied.
+        same_port = os.path.normcase(new_port) == os.path.normcase(self.port)
+        closed_ser = None
+        if same_port and self._ser.is_open:
+            # Same-port reconfigure (e.g. only baud/RTS-CTS changed): Windows
+            # refuses a second open of a port we already hold
+            # (PermissionError 13, "Access is denied"), so close before
+            # reopening. Swap in a placeholder first so the read loop parks
+            # on is_open=False instead of reading a closing port.
+            with self._write_lock:
+                closed_ser = self._ser
+                self._reinit_epoch += 1
+                self._ser = _DisconnectedSerial(new_port, baudrate=new_baud, rtscts=new_rtscts)
+            closed_ser.close()
+        # After a same-port close, Windows can report the port as busy for a
+        # few ms (the serial driver only releases the device once the reader
+        # thread's cancelled read completes), so retry the open a few times
+        # before giving up.
+        new_ser = None
+        last_err = None
+        for _ in range(5):
+            try:
+                new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
+                                        stopbits=1, timeout=0.02, rtscts=new_rtscts)
+                break
+            except (serial.SerialException, OSError) as e:
+                last_err = e
+                time.sleep(0.1)
+        if new_ser is None:
             logger.warning("reconfigure(port=%r, baud=%r, rtscts=%r) failed: %s",
-                            port, baud, rtscts, e)
-            return {"ok": False, "error": str(e)}
+                           new_port, new_baud, new_rtscts, last_err)
+            if closed_ser is not None:
+                # We already closed the previous connection - don't leave the
+                # link dead, try to restore it with its original settings.
+                try:
+                    restored = serial.Serial(self.port, baudrate=self.baud, bytesize=8,
+                                           parity="N", stopbits=1, timeout=0.02,
+                                           rtscts=closed_ser.rtscts)
+                    with self._write_lock:
+                        self._reinit_epoch += 1
+                        self._ser = restored
+                    logger.info("Reconfigure failed but the previous connection was restored")
+                except (serial.SerialException, OSError):
+                    logger.warning("Could not restore the previous connection either",
+                                   exc_info=True)
+            return {"ok": False, "error": str(last_err)}
 
         # Swap under _write_lock so an in-flight _write_raw()/_write_paced()
         # (which read self._ser under the same lock) can't observe a
@@ -1207,6 +1497,17 @@ class SerialLink:
         self._stop.set()
         self._reader.join(timeout=1.0)
         self._ser.close()
+
+    def resize_terminal(self, cols: int, rows: int):
+        """Re-grid the virtual terminal to match a resized GUI window. Font
+        and cell size stay fixed - a smaller window simply shows fewer
+        columns/rows. pyte clips at the top/right when shrinking (no reflow,
+        matching how xterm treats full-screen apps)."""
+        with self._screen_lock:
+            if cols == self.cols and rows == self.rows:
+                return
+            self.cols, self.rows = cols, rows
+            self._screen.resize(lines=rows, columns=cols)
 
     def _check_for_baud_mismatch(self, text: str):
         """Recover from the board resetting (reset button, REBOOT, a crashed
@@ -1241,53 +1542,203 @@ class SerialLink:
                         "its power-on rate) - falling back to %d baud", self.baud, self._default_baud)
         self.reconfigure(baud=self._default_baud, is_default_change=False)
 
+    def _set_prompt_state(self, line_s: str):
+        """Classify a prompt line into _system_state/_last_prompt.
+
+        The prompt SHAPE deliberately does not identify the OS flavour: the
+        whole ZCPR3 crowd (ZPM3, NZ-COM, Z3PLUS) shares the clock/named-dir
+        prompt style, so flagging ZPM3 from "A0:SYSTEM>" misidentifies NZ-COM
+        sessions every time an app exits back to the shell. OS identity comes
+        from boot/loader banners only (see _update_system_state)."""
+        if CPM_STATE_RE.search(line_s):
+            if self._system_state != "cpm":
+                logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
+            self._system_state = "cpm"
+            self._last_prompt = line_s
+        elif HBIOS_PROMPT_RE.search(line_s):
+            if self._system_state != "hbios":
+                logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
+            self._system_state = "hbios"
+            self._last_prompt = line_s
+        elif FLASH_PROMPT_RE.search(line_s):
+            if self._system_state != "flash_util":
+                logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
+            self._system_state = "flash_util"
+            self._last_prompt = line_s
+
     def _update_system_state(self, text: str):
         self._check_for_baud_mismatch(text)
 
         self._boot_buffer += text
-        # A fresh banner means a new boot: drop everything before it, or the
-        # buffer keeps older banners and the parsers - which take the first match
-        # they find - report the previous firmware. That bit for real after a ROM
-        # update, where the board had booted v3.7.0 and this still said v3.5.0.
-        last_banner = self._boot_buffer.rfind("RomWBW HBIOS v")
-        if last_banner > 0:
-            self._boot_buffer = self._boot_buffer[last_banner:]
+        self._rx_bytes_total += len(text)
+        # A fresh boot banner means a new boot: re-decide the OS flavor from
+        # scratch so booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
+        # misreported - drop the stale flags and cached versions; the banners
+        # and prompts below set them again within the same boot. The state
+        # too: during boot chatter the machine is at no prompt, and keeping
+        # the old one made the badge claim "CPM" (or ZPM3) while the loader
+        # was still printing hardware probe lines. "RomWBW HBIOS v" is the
+        # RomWBW banner; the loader banner ("... Boot Loader") and the "CBIOS
+        # v" line every CP/M-flavor boot prints serve as markers too.
+        # The banner can straddle two serial reads, so search the accumulated
+        # buffer rather than this chunk, and track the absolute position of
+        # the last occurrence actioned so each banner fires exactly once (the
+        # base is recomputed per call, so buffer truncation stays consistent).
+        base = self._rx_bytes_total - len(self._boot_buffer)
+        prev_fired = self._last_marker_fired_at
+        marker = None
+        marker_abs = prev_fired
+        for m in _NEW_BOOT_MARKERS:
+            idx = self._boot_buffer.rfind(m)
+            if idx >= 0 and base + idx > marker_abs:
+                marker, marker_abs = m, base + idx
+        if marker:
+            logger.info("New-boot marker %r - clearing OS environment", marker)
+            self._last_marker_fired_at = marker_abs
+            self._zpm3 = False
+            self._os_env = None
+            self._system_state = "unknown"
+            # The pending line tail is pre-boot text (typically the old OS's
+            # prompt, sitting newline-less). Gluing it to the boot chatter
+            # would re-process it as a fresh line and re-flag the old flavor
+            # right after we cleared it.
+            self._rx_linebuf = ""
+            self.hardware_info.pop("zpm3_version", None)
+            self.hardware_info.pop("zsdos_version", None)
+            self.hardware_info.pop("cpm_version", None)
+            self.hardware_info.pop("cpm3_version", None)
+            self.hardware_info.pop("nzcom_version", None)
+            self.hardware_info.pop("z3plus_version", None)
+            self.hardware_info.pop("boot_volume", None)
+            # Persist the clearing too: the dialect flags are seeded from this
+            # file at startup, so a stale zpm3_version here would have the next
+            # bridge process talking SDZ to a non-ZPM3 system.
+            self._save_hardware_info()
+            # The loader names the disk volume it boots ('Volume "Turbo
+            # Pascal"') just BEFORE the CBIOS line, so a marker-anchored
+            # forward scan can never see it. On a CBIOS marker, look back
+            # from the marker (but not past the previous boot's marker) to
+            # recover it. Other markers mean a fresh boot sequence is just
+            # starting - everything before them is the old boot, so no
+            # backward capture there. For app slices this Volume line is the
+            # only place the slice name appears.
+            if marker == "CBIOS v":
+                mrel = marker_abs - base
+                vidx = self._boot_buffer.rfind('Volume "', max(0, prev_fired - base), mrel)
+                if vidx >= 0:
+                    vend = self._boot_buffer.find('"', vidx + 8)
+                    if 0 < vend <= mrel:
+                        self._merge_hw_info({"boot_volume": self._boot_buffer[vidx + 8:vend]})
         if len(self._boot_buffer) > 8192:
             self._boot_buffer = self._boot_buffer[-4096:]
 
-        if "RomWBW" in text or "HBIOS" in text or "Boot:" in text or "Boot [" in text:
-            parsed = _parse_boot_banner(self._boot_buffer)
+        # Parse only the current boot's text: everything from the last RomWBW
+        # banner on (or, on hypothetical banner-less boot paths, from the last
+        # fallback marker). Older boots stay in the buffer for the baud-follow
+        # logic but must not shadow this boot's values in the parsers, which
+        # take the first match they find.
+        anchor = self._boot_buffer.rfind("RomWBW HBIOS v")
+        if anchor < 0:
+            anchor = max(self._boot_buffer.rfind(m) for m in _NEW_BOOT_MARKERS)
+        region = self._boot_buffer[anchor:] if anchor >= 0 else self._boot_buffer
+
+        # The parse triggers look at the whole region too, not just this
+        # chunk - a read can split a keyword anywhere ("ZSD" + "OS v1.1"),
+        # and a chunk-scoped trigger then silently never fires. Seen live: a
+        # ZSDOS boot left zsdos_version unset and the badge read CPM.
+        if any(k in region for k in ("RomWBW", "HBIOS", "Boot:", "Boot [")):
+            parsed = _parse_boot_banner(region)
             if parsed.get("version") or parsed.get("devices"):
-                self.hardware_info.update({k: v for k, v in parsed.items() if v})
-                self._save_hardware_info()
+                self._merge_hw_info(parsed)
 
-        if "ZSDOS" in text or "CBIOS" in text or "Configuring Drives" in text:
-            parsed_z = _parse_zsdos_banner(self._boot_buffer)
-            if parsed_z.get("zsdos_version") or parsed_z.get("drive_mappings"):
-                self.hardware_info.update({k: v for k, v in parsed_z.items() if v})
-                self._save_hardware_info()
+        if any(k in region for k in ("ZSDOS", "CBIOS", "CP/M-80", "Configuring Drives")):
+            parsed_z = _parse_zsdos_banner(region)
+            if (parsed_z.get("zsdos_version") or parsed_z.get("cpm_version")
+                    or parsed_z.get("drive_mappings")):
+                self._merge_hw_info(parsed_z)
+            if parsed_z.get("zsdos_version"):
+                self._os_env = "zsdos"
+            elif parsed_z.get("cpm_version"):
+                self._os_env = "cpm"
 
-        for line in text.splitlines():
+        # Environment banners. Scan from this boot's marker (the whole buffer
+        # when none ever fired) so a previous boot's banners cannot re-fire
+        # after the marker block cleared them. These run on every chunk, so
+        # the LAST block whose banner is present wins - that ordering matches
+        # the layering: CP/M 3 boots first, then Z3PLUS layers on top; ZSDOS
+        # boots first, then NZ-COM layers on top.
+        boot_start = self._last_marker_fired_at - base
+        scan = self._boot_buffer[boot_start:] if boot_start >= 0 else self._boot_buffer
+
+        # Forward Volume capture: covers boot paths with no CBIOS line (CP/M 3
+        # boots its own loader), where the Volume line DOES land after the
+        # last fired marker. CBIOS boots are handled by the backward capture
+        # in the marker block above.
+        vm = re.findall(r'Volume "([^"]+)"', scan)
+        if vm:
+            self._merge_hw_info({"boot_volume": vm[-1]})
+
+        m3 = re.search(r"(CP/M v3\.0 \[BANKED\] for HBIOS v[\w.\-]+)", scan)
+        if m3:
+            self._merge_hw_info({"cpm3_version": m3.group(1)})
+            self._os_env = "cpm3"
+
+        if "ZPM3" in region:
+            parsed_z3 = _parse_zpm3_banner(region)
+            if parsed_z3:
+                self._merge_hw_info(parsed_z3)
+                self._zpm3 = True
+                self._os_env = "zpm3"
+
+        if "NZCOM" in region or "NZ-COM" in region:
+            nzm = re.search(r"NZCOM Version ([\d.]+) System Loader for ([\w\-. ]+?)[\r\n]",
+                            region)
+            if nzm:
+                self._merge_hw_info(
+                    {"nzcom_version": f"NZ-COM {nzm.group(1)} ({nzm.group(2).strip()})"})
+            if "Booting NZ-COM" in region:
+                self._os_env = "nzcom"
+                # NZ-COM is a ZCPR3 system - same command dialect as ZPM3
+                # (SDZ/ERASE/...), so the dialect flag comes along. The prompt
+                # shape alone must never set this (see _set_prompt_state).
+                self._zpm3 = True
+
+        z3m = re.search(r"Z3PLUS.*?Vers\.\s*([\d.]+)", region, re.DOTALL)
+        if z3m:
+            self._merge_hw_info({"z3plus_version": f"Z3PLUS {z3m.group(1)} (CP/M Plus)"})
+            self._os_env = "z3plus"
+            self._zpm3 = True  # Z3PLUS is ZCPR3 on CP/M Plus - same dialect
+
+        buf = self._rx_linebuf + text
+        lines = buf.split("\n")
+        # The tail after the last newline is an incomplete line - hold it for
+        # the next chunk. A freshly printed prompt sits exactly there, with no
+        # newline ever coming after it, so check it against the strict
+        # prompt-only patterns below.
+        self._rx_linebuf = lines.pop()
+        for line in lines:
             line_s = line.strip()
             if not line_s:
                 continue
             if CPM_STATE_RE.search(line_s):
-                if self._system_state != "cpm":
-                    logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
-                self._system_state = "cpm"
-                self._last_prompt = line_s
+                self._set_prompt_state(line_s)
             elif HBIOS_PROMPT_RE.search(line_s):
-                if self._system_state != "hbios":
-                    logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
-                self._system_state = "hbios"
-                self._last_prompt = line_s
+                self._set_prompt_state(line_s)
             elif FLASH_PROMPT_RE.search(line_s):
-                if self._system_state != "flash_util":
-                    logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
-                self._system_state = "flash_util"
+                self._set_prompt_state(line_s)
+            elif (self._system_state == "hbios"
+                    and re.match(r"^(Loading|Booting)\s", line_s)):
+                # The loader just handed off to a selection (CP/M, Z-System,
+                # BASIC, Forth, a game, ...). Until whatever it is prints its
+                # own prompt, "hbios" is a lie - the badge goes blank instead.
+                self._system_state = "unknown"
                 self._last_prompt = line_s
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
                 self._last_prompt = line_s
+
+        tail_s = self._rx_linebuf.strip()
+        if tail_s and PROMPT_ONLY_RE.search(tail_s):
+            self._set_prompt_state(tail_s)
 
         # Checked against the accumulated boot buffer, not text.splitlines()
         # above - the RC2014 echoes typed input one character (or a small
@@ -1372,7 +1823,11 @@ class SerialLink:
                 time.sleep(0.2)
                 continue
             try:
-                data = ser.read(4096)
+                # Drain whatever the OS buffer already holds; block (briefly)
+                # for 1 byte when empty. read(4096) alone would accumulate
+                # until the timeout expires, delivering output in visible
+                # 100ms lumps instead of a smooth stream.
+                data = ser.read(ser.in_waiting or 1)
             except Exception as e:
                 # pyserial's read() isn't atomic about a concurrent close():
                 # depending on timing it raises SerialException, OSError, or
@@ -1424,7 +1879,7 @@ class SerialLink:
                         with self._mode_lock:
                             self._mode = "terminal"
                 else:
-                    banner_at = data.find(bytes([VERSION_BANNER]), pos)
+                    banner_at = data.find(bytes([VERSION_BANNER]), pos) if self._pixel_stream_enabled else -1
                     if banner_at == -1:
                         text = data[pos:].decode("latin-1")
                         self._update_system_state(text)
@@ -1524,7 +1979,14 @@ class SerialLink:
         elif append_enter and not text.endswith("\r"):
             text += "\r"
         data = text.encode("latin-1")
-        if len(data) > 1:
+        if data.startswith(b"\x1b"):
+            # Escape sequences (cursor keys, function keys) must arrive
+            # atomically: programs poll for the byte after ESC with a short
+            # timeout to tell a sequence from a lone ESC keypress, and the
+            # inter-byte gap of paced writes makes them misread as ESC.
+            # 3-6 byte bursts are far below any UART overrun threshold.
+            self._write_raw(data)
+        elif len(data) > 1:
             self._write_paced(data, *self.text_pacing)
         else:
             self._write_raw(data)
@@ -1548,7 +2010,10 @@ class SerialLink:
                 time.sleep(value)
                 continue
             sent.extend(value)
-            if len(value) > 1:
+            if value.startswith(b"\x1b"):
+                # Escape sequences must be atomic; see send_text().
+                self._write_raw(value)
+            elif len(value) > 1:
                 self._write_paced(value, *self.text_pacing)
             else:
                 self._write_raw(value)
@@ -1628,6 +2093,15 @@ class SerialLink:
                 "connected": self._ser.is_open,
                 "rx_active": rx_active, "tx_active": tx_active,
                 "system_state": self._system_state, "last_prompt": self._last_prompt,
+                # Which OS environment is up: the boot banners decide (latest
+                # layer wins - NZ-COM over ZSDOS, Z3PLUS over CP/M 3); with no
+                # banner seen, fall back to the ZCPR3 prompt shape, then the
+                # cached ZSDOS sign-on, then bare CP/M.
+                "os": (self._os_env
+                       or ("zpm3" if self._zpm3
+                           else "zsdos" if self.hardware_info.get("zsdos_version")
+                           else "cpm" if self._system_state == "cpm"
+                           else "")),
                 "current_op": self._current_op,
                 "xmodem_progress": dict(self._xmodem_progress)}
 
@@ -1662,7 +2136,7 @@ class SerialLink:
 
     def _wait_for_idle_prompt(self, start_pos: int, timeout: float,
                               idle_settle: float = 0.25, after_echo: str = "",
-                              nudge_after: float = None, nudge_bytes: bytes = b" ",
+                              nudge_after: float = None, nudge_bytes: bytes = b"\r",
                               max_nudges: int = 500) -> dict:
         """Wait until a prompt is the last thing on the wire and the board has
         gone quiet.
@@ -1687,9 +2161,20 @@ class SerialLink:
         `nudge_bytes` keystroke (which the pager consumes without echoing),
         capped at `max_nudges` so a command that's genuinely hung - not
         paged - still times out rather than looping forever.
+
+        The default nudge is CR, not space: the pagers this targets ask for
+        RETURN explicitly, and a stray nudge that misses the pager and lands
+        at a fresh shell prompt is then harmless (the prompt just reprints),
+        whereas a stray space stays in ZPM3's input line and gets the *next*
+        command rejected with " ?" - ZPM3 refuses a command with a leading
+        space. Nudges are also rate-limited to one per `nudge_after`: quiet is
+        measured from the last byte *received*, so without the cooldown a slow
+        page draw would collect a keystroke every idle_settle beat, and the
+        extras would land at the prompt once the pager exits.
         """
         deadline = time.time() + timeout
         nudges = 0
+        last_nudge_at = 0.0
         with self._rx_cond:
             while True:
                 text, _pos, _trunc = self._read_since_locked(start_pos)
@@ -1706,10 +2191,12 @@ class SerialLink:
                 if remaining <= 0:
                     return {"text": text, "prompt": "", "timed_out": True, "nudges": nudges}
                 if (nudge_after is not None and nudges < max_nudges
-                        and (time.time() - self._last_rx_time) >= nudge_after):
+                        and (time.time() - self._last_rx_time) >= nudge_after
+                        and (time.time() - last_nudge_at) >= nudge_after):
                     logger.debug("no prompt after %.1fs idle; nudging a possible pager (#%d)",
                                 nudge_after, nudges + 1)
                     self._write_raw(nudge_bytes)
+                    last_nudge_at = time.time()
                     nudges += 1
                 # Always wait a beat here, nudge or not - sending one and
                 # immediately re-checking would fire a burst of keystrokes
@@ -1718,13 +2205,18 @@ class SerialLink:
 
     @_exclusive("command")
     def run_command(self, command: str, timeout: float = 15.0,
-                    idle_settle: float = 0.25) -> dict:
+                    idle_settle: float = 0.25, nudge_after: float = None) -> dict:
         """Send a command and return only the output it produced.
 
         One call per command: sends, waits for the prompt to come back, strips
         the board's echo and the trailing prompt. Interactive programs that
         don't return to a shell prompt (MBASIC, ED) will time out here - use
         send_text()/get_screen() for those.
+
+        nudge_after opts into silent-pager handling (see _wait_for_idle_prompt):
+        DIR/SDZ listings on ZSDOS/ZPM3 page by CRT height and block on a
+        keystroke with no visible marker, which otherwise reads as "still
+        running" until timeout and returns just the first page.
         """
         started = time.time()
         # Let anything still in flight land before snapshotting. Otherwise the
@@ -1732,19 +2224,39 @@ class SerialLink:
         # and reads as "this command is done" - which silently truncated a slow
         # command's output (seen as a half-captured STAT during a drive scan).
         self._wait_until_quiet(idle_settle)
+        prep = _prepare_cpm_command(command, self._zpm3)
+        if prep["blocked"]:
+            return {
+                "ok": False,
+                "command": command,
+                "output": "",
+                "error": prep["blocked"],
+                "prompt": self._last_prompt or "",
+                "state": self._system_state,
+                "duration_s": round(time.time() - started, 2),
+                "timed_out": False,
+                "nudges": 0,
+                "zpm3_dialect": True,
+            }
+        command_to_send = prep["send"]
         start_pos = self.rx_position()
-        self.send_text(command)
+        self.send_text(command_to_send)
         res = self._wait_for_idle_prompt(start_pos, timeout, idle_settle,
-                                        after_echo=command.strip())
+                                        after_echo=command_to_send.strip(),
+                                        nudge_after=nudge_after)
         result = {
             "ok": not res["timed_out"],
             "command": command,
-            "output": _strip_echo_and_prompt(res["text"], command),
+            "output": _strip_echo_and_prompt(res["text"], command_to_send),
             "prompt": res["prompt"],
             "state": self._system_state,
             "duration_s": round(time.time() - started, 2),
             "timed_out": res["timed_out"],
+            "nudges": res["nudges"],
         }
+        if prep["translated_from"]:
+            result["translated_to"] = command_to_send
+            result["zpm3_dialect"] = True
 
         # The HBIOS boot loader acts on single letters, so a multi-character
         # command sent there silently does something else entirely: "DIR B:"
@@ -1799,6 +2311,7 @@ class SerialLink:
                 "total_blocks": 0,
                 "bytes": 0,
                 "direction": "SEND",
+                "start_time": None,  # monotonic ts once data actually flows
             }
         try:
             time.sleep(0.3)
@@ -1807,14 +2320,8 @@ class SerialLink:
 
             with open(path, "rb") as f:
                 data = f.read()
-            blocks = [data[i:i + BLOCK_SIZE] for i in range(0, len(data), BLOCK_SIZE)] or [b""]
-            if len(blocks[-1]) < BLOCK_SIZE:
-                blocks[-1] = blocks[-1] + bytes([SUB]) * (BLOCK_SIZE - len(blocks[-1]))
 
-            with self._mode_lock:
-                self._xmodem_progress["total_blocks"] = len(blocks)
-
-            logger.info("xmodem_send: file loaded (%d bytes, %d blocks)", len(data), len(blocks))
+            logger.info("xmodem_send: file loaded (%d bytes)", len(data))
             logger.info("Waiting for receiver handshake ('C' or NAK, timeout %.1fs)...", handshake_timeout)
 
             use_crc = None
@@ -1834,6 +2341,21 @@ class SerialLink:
 
             logger.info("xmodem_send: handshake established using %s", "CRC16" if use_crc else "Checksum")
 
+            # XMODEM-1K: a receiver that initiates with 'C' (CRC mode) accepts
+            # 1024-byte STX blocks; the sender picks the block size. Checksum
+            # (NAK) receivers only understand classic 128-byte SOH blocks.
+            blk_size = LONG_BLOCK_SIZE if use_crc else BLOCK_SIZE
+            soh = STX if use_crc else SOH
+            blocks = [data[i:i + blk_size] for i in range(0, len(data), blk_size)] or [b""]
+            if len(blocks[-1]) < blk_size:
+                blocks[-1] = blocks[-1] + bytes([SUB]) * (blk_size - len(blocks[-1]))
+
+            with self._mode_lock:
+                self._xmodem_progress["total_blocks"] = len(blocks)
+                self._xmodem_progress["start_time"] = time.monotonic()
+
+            logger.info("xmodem_send: %d blocks of %d bytes", len(blocks), blk_size)
+
             # RomWBW's XM pokes 'C' then a trailing 'K' (it would prefer 1K
             # blocks). Drain that, or it gets read as the response to block 1.
             # Bounded on both count and time: a receiver that keeps poking while
@@ -1848,7 +2370,7 @@ class SerialLink:
             try:
                 for idx, block in enumerate(blocks, start=1):
                     blocknum = idx & 0xFF  # XMODEM sequence numbers wrap at 256
-                    pkt = bytes([SOH, blocknum, (~blocknum) & 0xFF]) + block
+                    pkt = bytes([soh, blocknum, (~blocknum) & 0xFF]) + block
                     if use_crc:
                         crc = _crc16(block)
                         pkt += bytes([crc >> 8, crc & 0xFF])
@@ -1856,13 +2378,17 @@ class SerialLink:
                         pkt += bytes([_checksum(block)])
 
                     for attempt in range(1, MAX_RETRIES + 1):
+                        _t0 = time.monotonic()
                         self._write_paced(pkt)
+                        _t1 = time.monotonic()
                         resp = self._xq_get(timeout=10.0)
+                        _t2 = time.monotonic()
                         if resp == ACK:
-                            logger.debug("Block %d/%d ACKed", idx, len(blocks))
+                            logger.debug("Block %d/%d ACKed (write %.0fms, ack-wait %.0fms)",
+                                         idx, len(blocks), (_t1 - _t0) * 1000, (_t2 - _t1) * 1000)
                             with self._mode_lock:
                                 self._xmodem_progress["current_block"] = idx
-                                self._xmodem_progress["bytes"] = idx * BLOCK_SIZE
+                                self._xmodem_progress["bytes"] = idx * blk_size
                             break
                         if resp == CAN:
                             logger.warning("Receiver cancelled transfer on block %d", idx)
@@ -1907,6 +2433,7 @@ class SerialLink:
 
                 logger.info("xmodem_send complete (%d blocks).", len(blocks))
                 return {"ok": True, "blocks": len(blocks), "bytes": len(data),
+                        "block_size": blk_size,
                         "eot_acked": eot_ack, "prompt_nudged": nudge_prompt}
             except Exception as e:  # noqa: BLE001 - never leave the receiver hanging
                 logger.exception("Unexpected exception during xmodem_send: %s", e)
@@ -1934,6 +2461,7 @@ class SerialLink:
                 "total_blocks": 0,
                 "bytes": 0,
                 "direction": "RECV",
+                "start_time": None,
             }
         try:
             time.sleep(0.3)  # see comment in xmodem_send
@@ -1988,6 +2516,9 @@ class SerialLink:
                 size = BLOCK_SIZE if b0 == SOH else LONG_BLOCK_SIZE
                 last_block_size = size
                 got_first = True
+                with self._mode_lock:
+                    if self._xmodem_progress.get("start_time") is None:
+                        self._xmodem_progress["start_time"] = time.monotonic()
                 blk = self._xq_get(timeout=5.0)
                 nblk = self._xq_get(timeout=5.0)
                 payload = bytearray()
@@ -2045,6 +2576,493 @@ class SerialLink:
         return t
 
     # ------------------------------------------------------------------
+    # YMODEM sender/receiver (batch; the board-side program is ZMD)
+    # ------------------------------------------------------------------
+    def _xq_wait_for(self, wanted: set[int], timeout: float) -> int | None:
+        """Read until one of `wanted` arrives, dropping everything else.
+
+        YMODEM phases are separated by receiver pokes ('C') that arrive at
+        unpredictable times, so the byte that actually matters has to be
+        fished out of a stream that may hold strays."""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            b = self._xq_get(timeout=min(1.0, remaining))
+            if b in wanted:
+                return b
+
+    @staticmethod
+    def _ymodem_block0(wire_name: str, size: int | None) -> bytes:
+        """YMODEM block 0: SOH #0, 'NAME\\0<decimal-size>\\0' NUL-padded to
+        128, CRC16. size=None builds the all-NUL batch terminator."""
+        payload = b"" if size is None else (
+            wire_name.encode("latin-1") + b"\0" + str(size).encode("ascii") + b"\0")
+        payload = payload.ljust(BLOCK_SIZE, b"\0")
+        crc = _crc16(payload)
+        return bytes([SOH, 0, 0xFF]) + payload + bytes([crc >> 8, crc & 0xFF])
+
+    def _ymodem_send_one(self, wire_name: str, data: bytes, file_index: int) -> dict:
+        """One file inside a YMODEM batch: header block 0, 1K data blocks
+        numbered from 1, then the EOT NAK->ACK handshake. The receiver's
+        initial 'C' has already been consumed by ymodem_send."""
+        blocks = [data[i:i + LONG_BLOCK_SIZE]
+                  for i in range(0, len(data), LONG_BLOCK_SIZE)]
+        if blocks and len(blocks[-1]) < LONG_BLOCK_SIZE:
+            blocks[-1] = blocks[-1] + bytes([SUB]) * (LONG_BLOCK_SIZE - len(blocks[-1]))
+
+        with self._mode_lock:
+            self._xmodem_progress["filename"] = wire_name
+            self._xmodem_progress["file_index"] = file_index
+            self._xmodem_progress["current_block"] = 0
+            self._xmodem_progress["total_blocks"] = len(blocks)
+            self._xmodem_progress["bytes"] = 0
+            if self._xmodem_progress.get("start_time") is None:
+                self._xmodem_progress["start_time"] = time.monotonic()
+
+        header = self._ymodem_block0(wire_name, len(data))
+        for attempt in range(1, MAX_RETRIES + 1):
+            self._write_paced(header)
+            resp = self._xq_get(timeout=10.0)
+            if resp == ACK:
+                break
+            if resp == CAN:
+                self._xmodem_cancel()
+                return {"ok": False, "error": "receiver cancelled transfer"}
+            logger.warning("Block 0 (%s, attempt %d) got response %r, retrying",
+                           wire_name, attempt, hex(resp) if resp is not None else None)
+        else:
+            self._xmodem_cancel()
+            return {"ok": False,
+                    "error": f"block 0 ({wire_name}) failed after {MAX_RETRIES} retries"}
+
+        # YMODEM requires a fresh 'C' after the header ACK before data flows
+        # (ZMD 1.50 insists on it). On silence, resend the header and wait
+        # for its ACK again before waiting once more.
+        got_c = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            b = self._xq_wait_for({ord("C"), CAN}, timeout=10.0)
+            if b == ord("C"):
+                got_c = True
+                break
+            if b == CAN:
+                self._xmodem_cancel()
+                return {"ok": False, "error": "receiver cancelled transfer"}
+            logger.warning("No 'C' after block 0 ACK for %s (attempt %d); resending header",
+                           wire_name, attempt)
+            self._write_paced(header)
+            if self._xq_get(timeout=10.0) != ACK:
+                continue
+        if not got_c:
+            self._xmodem_cancel()
+            return {"ok": False,
+                    "error": f"no data request ('C') after block 0 for {wire_name}"}
+
+        for idx, block in enumerate(blocks, start=1):
+            blocknum = idx & 0xFF  # sequence numbers restart at 1 per file
+            pkt = bytes([STX, blocknum, (~blocknum) & 0xFF]) + block
+            crc = _crc16(block)
+            pkt += bytes([crc >> 8, crc & 0xFF])
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                self._write_paced(pkt)
+                resp = self._xq_get(timeout=10.0)
+                if resp == ACK:
+                    with self._mode_lock:
+                        self._xmodem_progress["current_block"] = idx
+                        self._xmodem_progress["bytes"] = idx * LONG_BLOCK_SIZE
+                    break
+                if resp == CAN:
+                    self._xmodem_cancel()
+                    return {"ok": False, "error": "receiver cancelled transfer"}
+                logger.warning("Block %d/%d (%s, attempt %d) got response %r, retrying",
+                               idx, len(blocks), wire_name, attempt,
+                               hex(resp) if resp is not None else None)
+            else:
+                self._xmodem_cancel()
+                return {"ok": False,
+                        "error": f"block {idx} ({wire_name}) failed after {MAX_RETRIES} retries"}
+
+        time.sleep(0.15)  # allow the receiver to flush the last block to disk
+
+        eot_ack = False
+        for attempt in range(1, 6):
+            self._write_raw(bytes([EOT]))
+            resp = self._xq_get(timeout=3.0)
+            if resp == ACK:
+                # An immediate ACK is fine too - some receivers skip the NAK round.
+                eot_ack = True
+                break
+            if resp == NAK:
+                continue  # standard YMODEM: first EOT is NAKed, resend, expect ACK
+            if resp == CAN:
+                self._xmodem_cancel()
+                return {"ok": False, "error": "receiver cancelled transfer"}
+        if not eot_ack:
+            self._xmodem_cancel()
+            return {"ok": False, "error": f"EOT not acknowledged for {wire_name}"}
+
+        return {"ok": True, "name": wire_name, "bytes": len(data),
+                "blocks": len(blocks), "sha256": hashlib.sha256(data).hexdigest()}
+
+    @_exclusive("YMODEM send")
+    def ymodem_send(self, files: list[tuple[str, str]],
+                    handshake_timeout: float = 30.0) -> dict:
+        """Send a batch of files over YMODEM to a receiver that is already
+        armed (ZMD R on the board).
+
+        files is a list of (host_path, wire_name) pairs; wire_name is the
+        bare 8.3 name carried in each block-0 header. Every file goes out
+        with its exact length in the header, so the receiver can trim block
+        padding - the thing plain XMODEM cannot do. After the last file a
+        terminating all-NUL block 0 ends the batch.
+        """
+        logger.info("ymodem_send initiated for %d file(s)", len(files))
+        pre_state = self._system_state
+        with self._mode_lock:
+            self._mode = "xmodem"
+            self._xmodem_progress = {
+                "active": True,
+                "protocol": "ymodem",
+                "filename": "",
+                "current_block": 0,
+                "total_blocks": 0,
+                "bytes": 0,
+                "direction": "SEND",
+                "start_time": None,  # monotonic ts once data actually flows
+                "file_index": 0,
+                "file_count": len(files),
+            }
+        try:
+            time.sleep(0.3)
+            with self._xmodem_q.mutex:
+                self._xmodem_q.queue.clear()
+
+            results = []
+            total_bytes = 0
+            for idx, (host_path, wire_name) in enumerate(files, start=1):
+                # The receiver pokes 'C' to request each file's block 0; the
+                # first of these waits is the handshake. Waiting per file
+                # (rather than once for the batch) keeps the pokes a receiver
+                # sends between files from being misread as header responses.
+                if self._xq_wait_for({ord("C")}, handshake_timeout) is None:
+                    self._xmodem_cancel()
+                    err = ("handshake timeout waiting for receiver" if idx == 1
+                           else f"timeout waiting for receiver before file "
+                                f"{idx} ({wire_name})")
+                    logger.error("ymodem_send: %s", err)
+                    return {"ok": False, "files": results, "error": err}
+                with open(host_path, "rb") as f:
+                    data = f.read()
+                res = self._ymodem_send_one(wire_name, data, idx)
+                if not res.get("ok"):
+                    return {**res, "files": results}
+                results.append(res)
+                total_bytes += len(data)
+                logger.info("ymodem_send: %s sent (%d bytes)", wire_name, len(data))
+
+            # Batch end: the receiver pokes 'C' for another header and gets
+            # the all-NUL block 0 instead.
+            if self._xq_wait_for({ord("C")}, handshake_timeout) is None:
+                self._xmodem_cancel()
+                return {"ok": False, "files": results,
+                        "error": "timeout waiting for receiver at batch end"}
+            for attempt in range(1, MAX_RETRIES + 1):
+                self._write_paced(self._ymodem_block0("", None))
+                resp = self._xq_get(timeout=10.0)
+                if resp == ACK:
+                    break
+                if resp == CAN:
+                    self._xmodem_cancel()
+                    return {"ok": False, "files": results,
+                            "error": "receiver cancelled transfer"}
+            else:
+                self._xmodem_cancel()
+                return {"ok": False, "files": results,
+                        "error": f"terminating block 0 failed after {MAX_RETRIES} retries"}
+
+            logger.info("ymodem_send complete: %d file(s), %d bytes.",
+                        len(results), total_bytes)
+            return {"ok": True, "files": results, "file_count": len(results),
+                    "bytes": total_bytes}
+        except Exception as e:  # noqa: BLE001 - never leave the receiver hanging
+            logger.exception("Unexpected exception during ymodem_send: %s", e)
+            self._xmodem_cancel()
+            return {"ok": False, "error": f"unexpected error: {e}"}
+        finally:
+            with self._mode_lock:
+                self._mode = "terminal"
+                self._xmodem_progress["active"] = False
+            if pre_state == "cpm":
+                # ZMD's exit cold-starts some boards: a CR nudge (xmodem_send's
+                # style) would land in the boot loader. Wait the reboot out
+                # passively instead - quick when this board's ZMD just returns
+                # to the prompt.
+                self._settle_after_zmd()
+
+    @_exclusive("YMODEM receive")
+    def ymodem_receive(self, dest_dir: str, handshake_timeout: float = 30.0,
+                       overall_timeout: float = 600.0,
+                       strip_padding: bool = True,
+                       expected_files: int | None = None) -> dict:
+        """Receive a YMODEM batch from a sender already armed on the board
+        (ZMD SB <names>), writing each file to dest_dir/<name>.
+
+        Per file: block 0 carries 'NAME\\0<decimal-size>\\0', data blocks
+        follow numbered from 1, and the EOT is NAKed once then ACKed. The
+        batch ends on an all-NUL block 0 - or, because ZMD's single-file send
+        terminates without one, on ~5s of silence after a file.
+
+        expected_files (passed by download_files as len(names)) matters for
+        ZMD 1.50's end-of-batch contract: with its file list exhausted, ZMD S
+        does NOT exit - it stays armed ("Your file(s) now ready to download")
+        until its own ~45-60s no-input timeout fires. ONE final 'C' (sent
+        ~0.5s after the last file's EOT-ACK) lets it finish: it answers with
+        CAN CAN + "-- File transfer aborted" and cold-starts the board, which
+        _settle_after_zmd rides out. A null block 0 from a better-behaved
+        sender (ACKed if one arrives), or ~3s of silence, end the batch
+        cleanly too - all three return ok with the files. CAN CAN before the
+        expected count is reached remains an error.
+
+        Received bytes are trimmed to the advertised size and then, with
+        strip_padding=True (the default, same convention as xmodem_receive),
+        stripped of trailing 0x1A. The size trim alone is NOT byte-exact for
+        ZMD sends: ZMD advertises 1K-rounded sizes because CP/M only knows
+        128-byte record counts (a 561-byte file arrives with size "1024").
+        Byte-exact binary requires strip_padding=False - and even then CP/M's
+        record granularity applies, exactly as documented for download().
+        """
+        pre_state = self._system_state
+        os.makedirs(dest_dir, exist_ok=True)
+        with self._mode_lock:
+            self._mode = "xmodem"
+            self._xmodem_progress = {
+                "active": True,
+                "protocol": "ymodem",
+                "filename": "",
+                "current_block": 0,
+                "total_blocks": 0,
+                "bytes": 0,
+                "direction": "RECV",
+                "start_time": None,
+                "file_index": 0,
+                "file_count": expected_files or 0,
+            }
+        try:
+            time.sleep(0.3)  # see comment in xmodem_send
+            with self._xmodem_q.mutex:
+                self._xmodem_q.queue.clear()
+
+            files = []
+            started = time.time()
+            deadline = started + overall_timeout
+            next_poke = 0.0
+            expect_block = 0        # 0 = waiting for a header block 0
+            cur_name = None
+            cur_size = None
+            out = bytearray()
+            eot_naked = False
+            # Once at least one file has landed, a few seconds of silence
+            # while waiting for the next header ends the batch cleanly (see
+            # docstring): 5s normally, 3s once the expected count is in.
+            grace_deadline = None
+            # One-shot timer for the final 'C' that lets ZMD end its
+            # send-batch (see docstring) - armed when the expected count
+            # completes, fired once, never re-armed.
+            final_c_at = None
+
+            while time.time() < deadline:
+                if expect_block == 0:
+                    if not files:
+                        if time.time() - started > handshake_timeout:
+                            self._xmodem_cancel()
+                            return {"ok": False,
+                                    "error": "handshake timeout waiting for sender"}
+                    elif grace_deadline is not None and time.time() >= grace_deadline:
+                        logger.info("No next file after grace period; batch ends "
+                                    "without a null header (ZMD end-of-batch)")
+                        break
+                    satisfied = (expected_files is not None
+                                 and len(files) >= expected_files)
+                    if satisfied:
+                        # Exactly ONE final 'C' - ZMD stays armed without it
+                        # (see docstring); periodic poking is NOT wanted.
+                        if final_c_at is not None and time.time() >= final_c_at:
+                            self._write_raw(bytes([ord("C")]))
+                            final_c_at = None
+                    elif time.time() >= next_poke:
+                        self._write_raw(bytes([ord("C")]))
+                        next_poke = time.time() + 3.0
+                elif expect_block == 1 and not out and time.time() >= next_poke:
+                    # ZMD opens the file after our header ACK and misses a 'C'
+                    # sent back-to-back with it (its own changelog describes
+                    # the race), so one poke is not enough: keep re-poking
+                    # until the first data block - or EOT for a 0-byte file -
+                    # actually arrives. Bounded by the overall timeout above.
+                    self._write_raw(bytes([ord("C")]))
+                    next_poke = time.time() + 2.0
+
+                b0 = self._xq_get(timeout=1.0)
+                if b0 is None:
+                    continue
+                if b0 == EOT:
+                    if expect_block == 0:
+                        continue  # stray EOT between files
+                    if not eot_naked:
+                        eot_naked = True
+                        self._write_raw(bytes([NAK]))  # first EOT: NAK it
+                        continue
+                    self._write_raw(bytes([ACK]))      # second EOT: file done
+                    data = bytes(out)
+                    if cur_size is not None:
+                        data = data[:cur_size]
+                    if strip_padding:
+                        while data.endswith(bytes([SUB])):
+                            data = data[:-1]
+                    dest_path = os.path.join(dest_dir, cur_name)
+                    with open(dest_path, "wb") as f:
+                        f.write(data)
+                    files.append({"ok": True, "name": cur_name,
+                                  "path": os.path.abspath(dest_path),
+                                  "bytes": len(data),
+                                  "sha256": hashlib.sha256(data).hexdigest()})
+                    logger.info("ymodem_receive: %s received (%d bytes)",
+                                cur_name, len(data))
+                    expect_block = 0
+                    cur_name = None
+                    cur_size = None
+                    out = bytearray()
+                    eot_naked = False
+                    if expected_files is not None and len(files) >= expected_files:
+                        # All requested files are in. ZMD S stays armed here
+                        # until its ~45-60s no-input timeout unless we send
+                        # ONE final 'C' - it answers with CAN CAN and
+                        # cold-starts, which is the clean (if rude) end. The
+                        # ~3s grace also covers a stray null block 0 from a
+                        # sender that terminates properly, or plain silence.
+                        grace_deadline = time.time() + 3.0
+                        final_c_at = time.time() + 0.5
+                    else:
+                        grace_deadline = time.time() + 5.0
+                        next_poke = 0.0
+                    continue
+                if b0 == CAN:
+                    if self._xq_get(timeout=1.0) == CAN:
+                        if (expected_files is not None
+                                and len(files) >= expected_files):
+                            # ZMD 1.50's cosmetic end-of-batch abort: every
+                            # requested file is already on disk, so this is a
+                            # clean end, not a cancellation.
+                            logger.info("CAN CAN after all %d expected file(s) - "
+                                        "ZMD's end-of-batch abort; treating as a "
+                                        "clean batch end", expected_files)
+                            break
+                        return {"ok": False, "files": files,
+                                "error": "sender cancelled transfer"}
+                    continue
+                if b0 not in (SOH, STX):
+                    continue  # ignore stray bytes between blocks
+
+                grace_deadline = None
+                size = BLOCK_SIZE if b0 == SOH else LONG_BLOCK_SIZE
+                blk = self._xq_get(timeout=5.0)
+                nblk = self._xq_get(timeout=5.0)
+                payload = bytearray()
+                for _ in range(size):
+                    byte = self._xq_get(timeout=5.0)
+                    if byte is None:
+                        break
+                    payload.append(byte)
+                c1, c2 = self._xq_get(timeout=5.0), self._xq_get(timeout=5.0)
+                ok_sum = (c1 is not None and c2 is not None
+                          and (c1 << 8 | c2) == _crc16(bytes(payload)))
+                valid = (blk is not None and nblk is not None and (blk ^ nblk) == 0xFF
+                         and len(payload) == size and ok_sum)
+
+                if expect_block == 0:
+                    if not (valid and blk == 0):
+                        self._write_raw(bytes([NAK]))
+                        continue
+                    if not any(payload):
+                        # All-NUL block 0: no more files. ACK and stop.
+                        self._write_raw(bytes([ACK]))
+                        break
+                    parts = bytes(payload).split(b"\0")
+                    raw_name = parts[0].decode("latin-1", errors="replace").strip()
+                    # A hostile or confused sender must not escape dest_dir.
+                    cur_name = os.path.basename(raw_name.replace("\\", "/"))
+                    try:
+                        cur_size = int(parts[1]) if len(parts) > 1 and parts[1] else None
+                    except ValueError:
+                        cur_size = None
+                    if not cur_name:
+                        self._write_raw(bytes([NAK]))
+                        cur_name = None
+                        continue
+                    self._write_raw(bytes([ACK]))
+                    self._write_raw(bytes([ord("C")]))  # ask for the data
+                    # ...and keep asking every ~2s until it starts (see the
+                    # re-poke above) - ZMD can miss this first 'C'.
+                    next_poke = time.time() + 2.0
+                    expect_block = 1
+                    out = bytearray()
+                    eot_naked = False
+                    with self._mode_lock:
+                        self._xmodem_progress["filename"] = cur_name
+                        self._xmodem_progress["file_index"] = len(files) + 1
+                        self._xmodem_progress["current_block"] = 0
+                        self._xmodem_progress["total_blocks"] = (
+                            (cur_size + LONG_BLOCK_SIZE - 1) // LONG_BLOCK_SIZE
+                            if cur_size is not None else 0)
+                        self._xmodem_progress["bytes"] = 0
+                        if self._xmodem_progress.get("start_time") is None:
+                            self._xmodem_progress["start_time"] = time.monotonic()
+                elif valid and blk == (expect_block & 0xFF):
+                    out.extend(payload)
+                    expect_block += 1
+                    with self._mode_lock:
+                        self._xmodem_progress["current_block"] = expect_block - 1
+                        self._xmodem_progress["bytes"] = len(out)
+                    self._write_raw(bytes([ACK]))
+                elif valid and blk == ((expect_block - 1) & 0xFF):
+                    # sender already sent this block (our ACK got lost,
+                    # possibly a retransmitted header) - ack again, don't re-append
+                    self._write_raw(bytes([ACK]))
+                else:
+                    self._write_raw(bytes([NAK]))
+
+            total = sum(f["bytes"] for f in files)
+            return {"ok": True, "files": files, "file_count": len(files),
+                    "bytes": total, "dest_dir": os.path.abspath(dest_dir)}
+        finally:
+            with self._mode_lock:
+                self._mode = "terminal"
+                self._xmodem_progress["active"] = False
+            if pre_state == "cpm":
+                # ZMD's exit cold-starts some boards - wait out the reboot
+                # before the caller (or an agent) types anything else.
+                self._settle_after_zmd()
+
+    def ymodem_send_async(self, files: list[tuple[str, str]], callback=None):
+        def _worker():
+            res = self.ymodem_send(files)
+            if callback:
+                callback(res)
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+
+    def ymodem_receive_async(self, dest_dir: str, callback=None):
+        def _worker():
+            res = self.ymodem_receive(dest_dir)
+            if callback:
+                callback(res)
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+
+    # ------------------------------------------------------------------
     # composite file operations
     # ------------------------------------------------------------------
     def _recover_console(self) -> bool:
@@ -2066,6 +3084,62 @@ class SerialLink:
             if not self._wait_for_idle_prompt(start, timeout=3.0)["timed_out"]:
                 return True
         logger.warning("Could not get the console back to a prompt after XM failed")
+        return False
+
+    def _settle_after_zmd(self, grace: float = 1.5, timeout: float = 45.0) -> bool:
+        """Wait for the console to be usable again after ZMD exits.
+
+        On the RC2014 (RC2014_std, 16550 console) EVERY ZMD exit - successful
+        batch end, abort, manual ^X ^X cancel - cold-starts the machine:
+        RC2014 art, RomWBW banner, hardware probe, Boot Loader, autoboot
+        back to ZPM3, ~11s in all. Root cause: ZMD's exit calls HBIOS
+        CIOINIT on the console UART (UNINIT in the HBIOS overlay) and that
+        re-init cold-starts this board; ZMD patched to skip it exits
+        cleanly. Boards whose ZMD lacks that overlay behaviour (SC126 etc.)
+        are unaffected.
+        Keystrokes sent in that window land in the boot loader, so
+        xmodem_send's CR nudge would be actively harmful here; the wait is
+        passive instead. A board/build whose ZMD simply returns to the prompt
+        costs only the short grace plus one settle check.
+
+        One exception to the passivity: ZMD's exit can stop at a "-- Hit a
+        key" prompt (seen on the RC2014 Zed Mini's ZMD 1.50), which leaves
+        the console dead until someone presses something. When that text is
+        seen - and only then - a CR is sent to release it. The keypress is
+        gated on the text actually appearing, so a ZMD version without the
+        pause is never poked, and a CR sent here can only land at ZMD's own
+        keypress wait, not in a boot loader.
+
+        Returns True once a fresh CP/M prompt is up.
+        """
+        time.sleep(grace)  # let an imminent cold start begin printing
+        pos = self.rx_position()
+        deadline = time.time() + timeout
+        rebooted = False
+        hitkey_presses = 0
+        last_hitkey_press = 0.0
+        while time.time() < deadline:
+            self._wait_until_quiet(1.0, timeout=max(0.1, deadline - time.time()))
+            text, pos, _ = self.read_since(pos)
+            if not rebooted and any(m in text for m in _NEW_BOOT_MARKERS):
+                rebooted = True
+                logger.info("ZMD exit cold-started the board; waiting for autoboot "
+                            "to bring the OS back")
+            lines = [l.strip() for l in self.get_screen().get("lines", []) if l.strip()]
+            if lines and CPM_PROMPT_RE.search(lines[-1]):
+                logger.info("Post-ZMD settle complete%s",
+                            " (board cold-started and autobooted)" if rebooted else "")
+                return True
+            if (hitkey_presses < 3
+                    and time.time() - last_hitkey_press >= 2.0
+                    and (ZMD_HIT_A_KEY_RE.search(text)
+                         or (lines and ZMD_HIT_A_KEY_RE.search(lines[-1])))):
+                logger.info("ZMD paused at 'Hit a key'; pressing CR to release it")
+                self._write_raw(b"\r")
+                hitkey_presses += 1
+                last_hitkey_press = time.time()
+            time.sleep(0.25)
+        logger.warning("No CP/M prompt within %.0fs of ZMD exiting", timeout)
         return False
 
     def _arm_xm(self, direction: str, target: str, block_1k: bool = False) -> dict:
@@ -2099,13 +3173,21 @@ class SerialLink:
                             timeout=8.0, since=start)
 
         deadline = time.time() + XM_ARM_SETTLE
+        armed_at = None
         while True:
             text, _pos, _truncated = self.read_since(start)
-            err = XM_ERROR_RE.search(text)
+            # ZPM3/RomWBW occasionally prints "+++ INVALID Z180 OPCODE @... +++"
+            # spontaneously on this class of machine (something resident runs
+            # undocumented Z80 IX-half ops the Z180 traps). It is NOT an XM
+            # refusal, but it contains "invalid" and would false-trip
+            # XM_ERROR_RE, so strip those lines before scanning.
+            scan_text = "\n".join(l for l in text.splitlines()
+                                  if "INVALID Z180 OPCODE" not in l)
+            err = XM_ERROR_RE.search(scan_text)
             if err:
                 # Report the whole offending line: the matched fragment on its own
                 # ("Bad", from "ZSDOS error on C: Bad Sector") isn't actionable.
-                line = next((l.strip() for l in reversed(text.splitlines())
+                line = next((l.strip() for l in reversed(scan_text.splitlines())
                              if l.strip() and XM_ERROR_RE.search(l)), err.group(0))
                 return {"ok": False, "error": f"XM refused: {line}",
                         "screen": text[-400:].strip(),
@@ -2115,6 +3197,13 @@ class SerialLink:
                 return {"ok": False,
                         "error": "XM exited without starting a transfer",
                         "screen": text[-400:].strip(), "recovered": True}
+            # "To cancel:" is XM's final banner line - once it prints, XM is
+            # definitely armed and the remaining settle time is wasted. Give a
+            # short grace for an error line to follow, then go.
+            if armed_at is None and "To cancel" in text:
+                armed_at = time.time()
+            if armed_at is not None and time.time() - armed_at >= 0.4:
+                break
             if time.time() >= deadline:
                 break
             time.sleep(0.1)
@@ -2123,11 +3212,134 @@ class SerialLink:
             logger.warning("XM banner not recognised; proceeding on handshake. Saw: %r", text[-200:])
         return {"ok": True, "armed": res["matched"]}
 
-    def _file_exists(self, target: str) -> bool:
-        listing = self.run_command(f"DIR {target}", timeout=DIR_TIMEOUT)
-        output = (listing.get("output") or "").upper()
+    def _arm_zmd(self, direction: str, files: list[str]) -> dict:
+        """Run ZMD on the board and decide whether it's really ready.
+
+        Same reasoning as _arm_xm: ZMD's banner is not a commitment either,
+        so watch for an error line or the shell prompt coming back before
+        trusting it. `zmd r` (receive) auto-detects a YMODEM batch from the
+        block-0 headers; `zmd sb <names>` (send) forces batch mode. The B
+        matters: plain `zmd s <one-file>` silently drops into XMODEM-1K
+        single-file mode and sends NO block-0 header, so a single-file
+        "batch" download never starts ("sender cancelled transfer" - ZMD's
+        abort when the receiver rejects a data block it never asked for).
+
+        ZMD 1.50's real banners: R prints "Receiving on:  Drive A, User 0."
+        and S prints "Your file(s) now ready to download"; both end with
+        "Abort: ^X pause ^X", which is the commitment line.
+        """
+        verb = "R" if direction == "receive" else "SB"
+        start = self.rx_position()
+        tail = f" {' '.join(files)}" if files else ""
+        self.send_text(f"{self._zmd_command()} {verb}{tail}")
+        res = self.wait_for(r"Receiving|Sending|File open|To cancel|Ctrl-X|"
+                            r"ready to download|Abort:",
+                            timeout=8.0, since=start)
+
+        deadline = time.time() + XM_ARM_SETTLE
+        armed_at = None
+        while True:
+            text, _pos, _truncated = self.read_since(start)
+            # "INVALID Z180 OPCODE" lines are spontaneous on some machines
+            # and are NOT a ZMD refusal - strip before the error scan, same
+            # as _arm_xm does.
+            scan_text = "\n".join(l for l in text.splitlines()
+                                  if "INVALID Z180 OPCODE" not in l)
+            err = XM_ERROR_RE.search(scan_text)
+            if err:
+                line = next((l.strip() for l in reversed(scan_text.splitlines())
+                             if l.strip() and XM_ERROR_RE.search(l)), err.group(0))
+                return {"ok": False, "error": f"ZMD refused: {line}",
+                        "screen": text[-400:].strip(),
+                        "recovered": self._recover_console()}
+            if TRAILING_PROMPT_RE.search(text):
+                return {"ok": False,
+                        "error": "ZMD exited without starting a transfer",
+                        "screen": text[-400:].strip(), "recovered": True}
+            if armed_at is None and ("To cancel" in text or "Ctrl-X" in text
+                                     or "Abort:" in text):
+                armed_at = time.time()
+            if armed_at is not None and time.time() - armed_at >= 0.4:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if not res["matched"]:
+            logger.warning("ZMD banner not recognised; proceeding on handshake. Saw: %r", text[-200:])
+        return {"ok": True, "armed": res["matched"]}
+
+    def _dir_command(self, target: str) -> str:
+        # ZPM3 cannot DIR user areas (e.g. J1:) - SDZ is its listing command.
+        return f"{'SDZ' if self._zpm3 else 'DIR'} {target}"
+
+    def _drive_free_bytes(self, drive: str) -> int | None:
+        """Bytes free on a drive, using the dialect appropriate for the OS."""
+        if self._zpm3:
+            sdz = self.run_command(f"SDZ {drive}:", timeout=DIR_TIMEOUT)
+            return _parse_sdz_free_space(sdz.get("output", ""))
+        stat = self.run_command(f"STAT {drive}:", timeout=DIR_TIMEOUT)
+        return _parse_stat_free_space(stat.get("output", ""))
+
+    def _current_drive_mappings(self) -> dict:
+        """Live drive->device map from ZPM3's ASSIGN ('A:=SD0:4' lines).
+
+        The boot banner's mapping is only what the loader set up - ZPM3 can
+        re-assign letters at any time afterwards (seen in the field: A:=SD0:4,
+        B:=MD0:0), and labelling a listing with the stale boot mapping then
+        misreports both the device and every classification derived from it.
+        ASSIGN's output is authoritative; on any parse failure the caller
+        falls back to the persisted boot-time map."""
+        res = self.run_command("ASSIGN", timeout=DIR_TIMEOUT)
+        mapping = {}
+        for line in res.get("output", "").splitlines():
+            m = re.match(r"^\s*([A-P])\s*:=\s*([A-Z]+\d+:\d+)", line, re.IGNORECASE)
+            if m:
+                mapping[m.group(1).upper()] = m.group(2).upper()
+        if mapping:
+            self.hardware_info["drive_mappings"] = mapping
+            self._save_hardware_info()
+        return mapping
+
+    def _erase(self, target: str) -> None:
+        # ZPM3 (CP/M+ ZCPR) delete is ERASE (ERA does not exist) and it
+        # only takes a bare filename - switch to the target drive:user first.
+        if self._zpm3:
+            if ":" in target:
+                du, bare = target.split(":", 1)
+                self.run_command(f"{du}:", timeout=DIR_TIMEOUT)
+                self.run_command(f"ERASE {bare}", timeout=DIR_TIMEOUT)
+            else:
+                self.run_command(f"ERASE {target}", timeout=DIR_TIMEOUT)
+        else:
+            self.run_command(f"ERA {target}", timeout=DIR_TIMEOUT)
+
+    def _file_listing(self, target: str) -> str:
+        listing = self.run_command(self._dir_command(target), timeout=DIR_TIMEOUT)
+        output = listing.get("output") or ""
+        up = output.upper()
+        if "ILLEGAL COMMAND TAIL" in up or "UNRECOGNIZED" in up:
+            # Fallback in case ZPM3 was not detected from the prompt.
+            listing = self.run_command(f"SDZ {target}", timeout=DIR_TIMEOUT)
+            output = listing.get("output") or ""
+        return output
+
+    def _listing_has_file(self, output: str, target: str) -> bool:
+        up = output.upper()
         stem = target.split(":")[-1].split(".")[0].upper()
-        return "NO FILE" not in output and bool(stem) and stem in output
+        return ("NO FILE" not in up and "NO DETECTABLE FILE" not in up
+                and bool(stem) and stem in up)
+
+    def _file_exists(self, target: str) -> bool:
+        return self._listing_has_file(self._file_listing(target), target)
+
+    def _free_bytes_from(self, listing_output: str, drive: str) -> int | None:
+        # ZPM3's SDZ appends a 'Free: Nk' trailer to every listing, including
+        # the file-targeted exists-check the upload just ran - reuse it
+        # instead of spending a second command on a free-space probe.
+        if self._zpm3:
+            return _parse_sdz_free_space(listing_output)
+        return self._drive_free_bytes(drive)
 
     def _encode_upload_content(self, content: str, binary: bool) -> bytes:
         if binary:
@@ -2151,7 +3363,8 @@ class SerialLink:
 
         RomWBW's UNZIP refuses to overwrite an existing file (reports
         "EXISTS" and skips it - confirmed against real hardware) just like
-        XM does, so overwrite=True erases the existing target first.
+        XM does, so overwrite=True erases the existing target first. On ZPM3
+        the unzipper is UNZIPZ, which only CRC-checks unless given /E.
         """
         if self._system_state != "cpm":
             return {"ok": False, "error": f"system is not at a CP/M prompt "
@@ -2167,18 +3380,21 @@ class SerialLink:
         target = _format_target(drive, user, name)
         started = time.time()
 
-        exists = self._file_exists(target)
+        listing_out = self._file_listing(target)
+        exists = self._listing_has_file(listing_out, target)
         if exists and not overwrite:
-            stat = self.run_command(f"STAT {target}", timeout=DIR_TIMEOUT)
+            extra = {}
+            if not self._zpm3:
+                stat = self.run_command(f"STAT {target}", timeout=DIR_TIMEOUT)
+                extra = _parse_stat_file_info(stat.get("output", ""))
             return {"ok": False, "target": target, "existed_before": True,
                     "error": f"{target} already exists and overwrite is disabled",
-                    **_parse_stat_file_info(stat.get("output", ""))}
+                    **extra}
 
         raw = self._encode_upload_content(content, binary)
         zip_bytes = _zip_single_entry(name, raw)
 
-        stat = self.run_command(f"STAT {drive}:", timeout=DIR_TIMEOUT)
-        free = _parse_stat_free_space(stat.get("output", ""))
+        free = self._free_bytes_from(listing_out, drive)
         needed = len(zip_bytes) + len(raw)  # zip and its extracted copy briefly coexist
         if free is not None and free < needed:
             return {"ok": False, "target": target, "error": "insufficient space",
@@ -2186,6 +3402,14 @@ class SerialLink:
 
         stem = name.split(".")[0]
         zip_target = f"{drive}:{stem}.ZIP"
+
+        # XM refuses to overwrite, so a staging zip left behind by an
+        # interrupted upload would poison every retry - clear it first.
+        # No post-erase re-check here: if the erase failed, XM's own
+        # "File exists" refusal comes back from _arm_xm() as the error.
+        if self._file_exists(zip_target):
+            logger.info("%s exists from a previous upload; erasing it", zip_target)
+            self._erase(zip_target)
 
         tmp_path = None
         try:
@@ -2207,11 +3431,19 @@ class SerialLink:
         if exists:
             # UNZIP won't replace an existing file (see docstring); erase it
             # first, same as the old XM-direct path had to.
-            self.run_command(f"ERA {target}", timeout=DIR_TIMEOUT)
+            self._erase(target)
+            if self._file_exists(target):
+                return {"ok": False, "target": target,
+                        "error": f"could not erase existing {target} (read-only drive?)"}
 
-        self.run_command(f"UNZIP {zip_target} {_format_target(drive, user, '')}",
-                         timeout=DIR_TIMEOUT)
-        self.run_command(f"ERA {zip_target}", timeout=DIR_TIMEOUT)
+        # ZPM3 ships UNZIPZ, which only CRC-checks an archive unless told
+        # otherwise - /E is what actually extracts (confirmed live: bare
+        # "UNZIP B:X.ZIP B:" printed "Checking..." and created nothing).
+        unzip_cmd = f"UNZIP {zip_target} {_format_target(drive, user, '')}"
+        if self._zpm3:
+            unzip_cmd += " /E"
+        self.run_command(unzip_cmd, timeout=DIR_TIMEOUT)
+        self._erase(zip_target)
 
         verified = self._file_exists(target)
         return {
@@ -2223,7 +3455,7 @@ class SerialLink:
             "bytes_wire": len(zip_bytes),
             "compressed": True,
             "blocks": send_res.get("blocks"),
-            "block_size": BLOCK_SIZE,
+            "block_size": send_res.get("block_size", BLOCK_SIZE),
             "duration_s": round(time.time() - started, 2),
             "verified": verified,
             "sha256": hashlib.sha256(raw).hexdigest(),
@@ -2305,6 +3537,364 @@ class SerialLink:
             "verified": True,
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
+
+    @_exclusive("upload file")
+    def upload_file(self, host_path: str, drive: str, user: int = 0,
+                    name: str | None = None, overwrite: bool = False) -> dict:
+        """Send a host file to the board over raw XMODEM - no zip staging.
+
+        The file's bytes go on the wire verbatim (xmodem_send pads the final
+        128-byte block with 0x1A, which doubles as the CP/M text EOF marker).
+        Text files should already have CRLF line endings; nothing is
+        transcoded. Without UNZIP's whole-file CRC, integrity rests on
+        XMODEM's per-block CRC16 plus the post-transfer STAT record count.
+
+        name defaults to the host file's basename, uppercased - it must be a
+        valid 8.3 CP/M name. XM refuses to overwrite, so overwrite=True erases
+        an existing target first.
+        """
+        if self._system_state != "cpm":
+            return {"ok": False, "error": f"system is not at a CP/M prompt "
+                                          f"(state={self._system_state!r}); boot an OS first"}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
+        if not os.path.isfile(host_path):
+            return {"ok": False, "error": f"host file not found: {host_path}"}
+        if name is None:
+            name = os.path.basename(host_path).upper()
+        err = _validate_cpm_name(name)
+        if err:
+            return {"ok": False, "error": f"{err} (pass name= to override the "
+                                          f"host basename {os.path.basename(host_path)!r})"}
+
+        name = name.upper()
+        drive = drive.rstrip(":").upper()
+        target = _format_target(drive, user, name)
+        started = time.time()
+
+        with open(host_path, "rb") as f:
+            raw = f.read()
+
+        listing_out = self._file_listing(target)
+        exists = self._listing_has_file(listing_out, target)
+        if exists:
+            if not overwrite:
+                extra = {}
+                if not self._zpm3:
+                    stat = self.run_command(f"STAT {target}", timeout=DIR_TIMEOUT)
+                    extra = _parse_stat_file_info(stat.get("output", ""))
+                return {"ok": False, "target": target, "existed_before": True,
+                        "error": f"{target} already exists and overwrite is disabled",
+                        **extra}
+            self._erase(target)
+            if self._file_exists(target):
+                return {"ok": False, "target": target,
+                        "error": f"could not erase existing {target} (read-only drive?)"}
+
+        # Free space from the pre-erase listing is a conservative lower bound
+        # (erasing only frees more), so it stays valid after the erase.
+        free = self._free_bytes_from(listing_out, drive)
+        if free is not None and free < len(raw):
+            return {"ok": False, "target": target, "error": "insufficient space",
+                    "available": free, "needed": len(raw)}
+
+        armed = self._arm_xm("receive", target)
+        if not armed["ok"]:
+            return {**armed, "target": target}
+
+        send_res = self.xmodem_send(host_path)
+        if not send_res.get("ok"):
+            return {**send_res, "target": target}
+
+        verified = self._file_exists(target)
+        return {
+            "ok": verified,
+            "target": target,
+            "host_path": host_path,
+            "existed_before": exists,
+            "replaced_existing": exists,
+            "bytes_raw": len(raw),
+            "bytes_wire": len(raw),
+            "compressed": False,
+            "blocks": send_res.get("blocks"),
+            "block_size": send_res.get("block_size", BLOCK_SIZE),
+            "duration_s": round(time.time() - started, 2),
+            "verified": verified,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    @_exclusive("download file")
+    def download_file(self, name: str, drive: str, user: int = 0,
+                      dest_path: str | None = None) -> dict:
+        """Copy a file off the board over XMODEM (1K blocks) to a host path.
+
+        Bytes are written verbatim - CP/M's 128-byte record granularity means
+        the file may carry trailing padding (typically 0x1A) past its logical
+        end; CP/M stores no sub-record length, so nothing can trim that
+        reliably. dest_path defaults to the current directory under the CP/M
+        filename.
+        """
+        if self._system_state != "cpm":
+            return {"ok": False, "error": f"system is not at a CP/M prompt "
+                                          f"(state={self._system_state!r}); boot an OS first"}
+        err = _validate_cpm_name(name)
+        if err:
+            return {"ok": False, "error": err}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
+
+        name = name.upper()
+        drive = drive.rstrip(":").upper()
+        target = _format_target(drive, user, name)
+        if dest_path is None:
+            dest_path = name
+        started = time.time()
+
+        if not self._file_exists(target):
+            return {"ok": False, "target": target, "error": "not found"}
+
+        armed = self._arm_xm("send", target, block_1k=True)
+        if not armed["ok"]:
+            return {**armed, "target": target}
+
+        res = self.xmodem_receive(dest_path, strip_padding=False)
+        if not res.get("ok"):
+            return {**res, "target": target}
+        with open(dest_path, "rb") as f:
+            raw = f.read()
+
+        return {
+            "ok": True,
+            "target": target,
+            "dest_path": os.path.abspath(dest_path),
+            "bytes_raw": len(raw),
+            "bytes_wire": len(raw),
+            "compressed": False,
+            "blocks": res.get("blocks"),
+            "block_size": res.get("block_size"),
+            "duration_s": round(time.time() - started, 2),
+            "verified": True,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def _current_du(self) -> str | None:
+        """'A1:'-style drive/user parsed from the last CP/M prompt, or None
+        when the prompt can't be parsed - callers then skip the restore
+        rather than typing a guess at the board."""
+        # ZPM3 wraps prompt segments in ANSI bold escapes; strip them or the
+        # named-dir forms ("A0:SYSTEM\x1b[1m\x1b[m>") never match.
+        prompt = re.sub(r"\x1b\[[0-9;]*m", "", self._last_prompt or "")
+        m = _DU_FROM_PROMPT_RE.search(prompt)
+        if not m:
+            return None
+        if m.group(2):  # "2A>" - user first (classic CP/M ordering)
+            user, drive = m.group(1), m.group(2)
+        else:           # "C2>" / "A>" - drive first (RomWBW/ZSDOS ordering)
+            drive, user = m.group(3), m.group(4)
+        return f"{drive}{int(user or 0)}:"
+
+    @_exclusive("upload files")
+    def upload_files(self, host_paths: list[str], drive: str, user: int = 0,
+                     overwrite: bool = False) -> dict:
+        """Send several host files to the board in one YMODEM batch (ZMD R).
+
+        One arming for the whole batch, 1K blocks, and each file's exact
+        length travels in its block-0 header - so unlike the XMODEM path the
+        board side knows precisely where every file ends. Target names are
+        the host basenames uppercased (each must be a valid 8.3 CP/M name).
+
+        The board is switched to the target drive/user first and switched
+        back afterwards. overwrite semantics mirror upload_file: an existing
+        target fails the whole batch (before anything is armed) unless
+        overwrite=True, which erases it first and verifies the erasure.
+        NOTE: ZMD's exit cold-starts some boards (RomWBW banner + autoboot,
+        ~11s) - expected behaviour, handled and waited out internally, not
+        a crash.
+        """
+        if self._system_state != "cpm":
+            return {"ok": False, "error": f"system is not at a CP/M prompt "
+                                          f"(state={self._system_state!r}); boot an OS first"}
+        if not host_paths:
+            return {"ok": False, "error": "no files given"}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
+        drive = drive.rstrip(":").upper()
+        started = time.time()
+
+        # Validate everything before touching the board.
+        files = []  # (host_path, wire_name)
+        seen = set()
+        total = 0
+        for host_path in host_paths:
+            if not os.path.isfile(host_path):
+                return {"ok": False, "error": f"host file not found: {host_path}"}
+            wire = os.path.basename(host_path).upper()
+            err = _validate_cpm_name(wire)
+            if err:
+                return {"ok": False, "error": f"{err} (from host basename "
+                                              f"{os.path.basename(host_path)!r})"}
+            if wire in seen:
+                return {"ok": False, "error": f"duplicate target name {wire} in batch"}
+            seen.add(wire)
+            total += os.path.getsize(host_path)
+            files.append((host_path, wire))
+
+        prev_du = self._current_du()
+        target_du = f"{drive}{user}:"
+        try:
+            switch = self.run_command(target_du, timeout=DIR_TIMEOUT)
+            if not switch.get("ok"):
+                return {"ok": False, "error": f"could not switch to {target_du}",
+                        "screen": (switch.get("output") or "")[-400:]}
+
+            targets = [_format_target(drive, user, wire) for _, wire in files]
+            existed = []
+            listing_out = ""
+            for target in targets:
+                listing_out = self._file_listing(target)
+                if self._listing_has_file(listing_out, target):
+                    existed.append(target)
+            if existed:
+                if not overwrite:
+                    return {"ok": False, "existed_before": existed,
+                            "error": ", ".join(existed) +
+                                     " already exist and overwrite is disabled"}
+                for target in existed:
+                    self._erase(target)
+                    if self._file_exists(target):
+                        return {"ok": False, "target": target,
+                                "error": f"could not erase existing {target} "
+                                         f"(read-only drive?)"}
+
+            free = self._free_bytes_from(listing_out, drive)
+            if free is not None and free < total:
+                return {"ok": False, "error": "insufficient space",
+                        "available": free, "needed": total}
+
+            armed = self._arm_zmd("receive", [])
+            if not armed["ok"]:
+                return armed
+
+            send_res = self.ymodem_send(files)
+            if not send_res.get("ok"):
+                return send_res
+
+            verified = []
+            missing = []
+            for target in targets:
+                # ZSDOS flushes directory writes lazily, so a file ZMD has
+                # already closed can be invisible to SDZ for a moment after
+                # the batch ends - give a negative answer a second chance.
+                found = self._file_exists(target)
+                if not found:
+                    time.sleep(0.5)
+                    found = self._file_exists(target)
+                (verified if found else missing).append(target)
+            return {
+                "ok": not missing,
+                "drive": drive,
+                "user": user,
+                "files": send_res["files"],
+                "file_count": len(send_res["files"]),
+                "bytes": send_res["bytes"],
+                "duration_s": round(time.time() - started, 2),
+                "verified": not missing,
+                "missing": missing,
+            }
+        finally:
+            # Restore even when prev_du == target_du: ZMD itself can move the
+            # board's current DU during a transfer (observed: exits at A0).
+            if prev_du:
+                self.run_command(prev_du, timeout=DIR_TIMEOUT)
+
+    @_exclusive("download files")
+    def download_files(self, names: list[str], drive: str, user: int = 0,
+                       dest_dir: str = ".", strip_padding: bool = True) -> dict:
+        """Copy several board files to host files in one YMODEM batch
+        (ZMD SB name1 name2 ...).
+
+        All sources are verified to exist before anything is armed, and a
+        single `zmd sb` sends the whole batch - the B forces batch mode, so
+        even a one-file download gets a block-0 header (plain `zmd s` with
+        one file silently falls back to XMODEM-1K and sends none). Note
+        CP/M's ~127-character command-line cap bounds how many names fit in
+        one call. Each file is written to dest_dir/<name> with a sha256.
+
+        ZMD advertises 1K-rounded sizes in its block-0 headers (CP/M only
+        knows 128-byte record counts), so the header alone cannot trim a
+        ZMD send byte-exactly. strip_padding=True (the default, same
+        convention as the XMODEM tools) also strips trailing 0x1A, which is
+        right for text; pass False for byte-exact binary, where CP/M's
+        128-byte record granularity still applies (see download()).
+
+        The board is switched to the source drive/user first and switched
+        back afterwards. NOTE: ZMD's exit cold-starts some boards (RomWBW
+        banner + autoboot, ~11s) - expected behaviour, handled and waited
+        out internally, not a crash. ZMD 1.50 S also stays armed after its
+        last file (until its own ~45-60s no-input timeout), so the receiver
+        sends ONE final 'C' to release it; ZMD's CAN CAN + "-- File
+        transfer aborted" answer and the cold start after it are the normal
+        end of a batch, reported as success.
+        """
+        if self._system_state != "cpm":
+            return {"ok": False, "error": f"system is not at a CP/M prompt "
+                                          f"(state={self._system_state!r}); boot an OS first"}
+        if not names:
+            return {"ok": False, "error": "no files given"}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
+        drive = drive.rstrip(":").upper()
+        started = time.time()
+
+        names = [n.upper() for n in names]
+        for name in names:
+            err = _validate_cpm_name(name)
+            if err:
+                return {"ok": False, "error": err}
+
+        prev_du = self._current_du()
+        target_du = f"{drive}{user}:"
+        try:
+            switch = self.run_command(target_du, timeout=DIR_TIMEOUT)
+            if not switch.get("ok"):
+                return {"ok": False, "error": f"could not switch to {target_du}",
+                        "screen": (switch.get("output") or "")[-400:]}
+
+            targets = [_format_target(drive, user, name) for name in names]
+            missing = [t for t in targets if not self._file_exists(t)]
+            if missing:
+                return {"ok": False, "error": "not found: " + ", ".join(missing),
+                        "missing": missing}
+
+            armed = self._arm_zmd("send", names)
+            if not armed["ok"]:
+                return armed
+
+            res = self.ymodem_receive(dest_dir, strip_padding=strip_padding,
+                                      expected_files=len(names))
+            if not res.get("ok"):
+                return res
+
+            received = {f["name"].upper() for f in res["files"]}
+            missing = [t for t, n in zip(targets, names) if n not in received]
+            return {
+                "ok": not missing,
+                "drive": drive,
+                "user": user,
+                "files": res["files"],
+                "file_count": len(res["files"]),
+                "bytes": res["bytes"],
+                "dest_dir": res["dest_dir"],
+                "strip_padding": strip_padding,
+                "duration_s": round(time.time() - started, 2),
+                "verified": not missing,
+                "missing": missing,
+            }
+        finally:
+            # Restore even when prev_du == target_du: ZMD itself can move the
+            # board's current DU during a transfer (observed: exits at A0).
+            if prev_du:
+                self.run_command(prev_du, timeout=DIR_TIMEOUT)
 
     @_exclusive("read file")
     def read_text_file(self, cpm_path: str, max_bytes: int = 8192,

@@ -254,6 +254,79 @@ class TestUpload(TransferTestCase):
                          "the zip staging file must be cleaned up")
 
 
+class TestUploadZpm3(TransferTestCase):
+    """ZPM3 (ZCPR/CP/M+) speaks a different dialect: SDZ instead of DIR (DIR
+    can't address user areas), ERASE instead of ERA, STAT has no drive-space
+    form (SDZ's 'Free: Nk' trailer is the source), and its UNZIPZ only
+    CRC-checks an archive unless given /E - all confirmed live on an SC126
+    running ZPM3."""
+
+    def setUp(self):
+        super().setUp()
+        self.link._zpm3 = True
+
+    def _responder_for(self, exists_before: bool = False):
+        files = {"LEDSHOW.COM"} if exists_before else set()
+        zpm3_prompt = b"\r\n15:45 B0>"
+
+        def _responder(line: bytes):
+            self.commands.append(line)
+            cmd = line.decode("latin-1").strip().upper()
+            if cmd.startswith("SDZ"):
+                # "SDZ B:" (free-space probe) or "SDZ B:LEDSHOW.COM"
+                stem = cmd.split(":")[-1].replace(".", "").strip()
+                if stem and stem not in {f.replace(".", "") for f in files}:
+                    return b"\r\n >> No detectable file(s) on B0:   Free: 4000k \r\n" + zpm3_prompt
+                listing = b"".join(b"\r\nB0: " + f.encode() for f in files)
+                return listing + b"\r\nFree: 4000k\r\n" + zpm3_prompt
+            if cmd.startswith("STAT"):
+                return b"\r\nSTAT ?\r\n" + zpm3_prompt  # ZPM3 STAT has no space form
+            if cmd.startswith("ERASE"):
+                fname = cmd.split(None, 1)[1]
+                files.discard(fname)
+                return zpm3_prompt
+            if "XM R" in cmd:
+                return b"\r\nReceiving: B0:LEDSHOW.ZIP\r\nTo cancel: Ctrl-X\r\n"
+            if cmd.startswith("UNZIP"):
+                if "/E" not in cmd:
+                    # UNZIPZ's default is a CRC check - nothing is extracted.
+                    return b"\r\nChecking...\r\nDone.\r\n" + zpm3_prompt
+                files.add("LEDSHOW.COM")
+                return b"\r\nExtracting\r\n" + zpm3_prompt
+            return zpm3_prompt
+
+        self.fake.responder = _responder
+
+    def test_upload_uses_the_zpm3_dialect(self):
+        self._responder_for(exists_before=False)
+        res = self.link.upload("LEDSHOW.COM", "B", content="x")
+
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["verified"])
+        commands = self.command_text()
+        self.assertIn("UNZIP B:LEDSHOW.ZIP B: /E", commands)
+        self.assertTrue(any(c.startswith("SDZ") for c in commands))
+        self.assertFalse(any(c.startswith("DIR ") for c in commands))
+        self.assertFalse(any(c.startswith("ERA ") for c in commands))
+
+    def test_overwrite_erases_with_bare_filename_after_drive_switch(self):
+        self._responder_for(exists_before=True)
+        res = self.link.upload("LEDSHOW.COM", "B", content="x", overwrite=True)
+
+        self.assertTrue(res["ok"], res)
+        commands = self.command_text()
+        self.assertIn("ERASE LEDSHOW.COM", commands)
+        erase_index = commands.index("ERASE LEDSHOW.COM")
+        unzip_index = next(i for i, c in enumerate(commands) if c.startswith("UNZIP"))
+        self.assertLess(erase_index, unzip_index, "must erase the old target before UNZIP")
+
+    def test_free_space_comes_from_sdz_when_stat_has_no_space_form(self):
+        self._responder_for()
+        res = self.link.upload("LEDSHOW.COM", "B", content="x")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("SDZ B:", self.command_text())
+
+
 class TestDownload(TransferTestCase):
     def test_arms_xm_with_1k_blocks_receives_and_hashes(self):
         self.respond({b"XM SK": b"\r\nSending: LEDSHOW.COM\r\nTo cancel: Ctrl-X\r\n",
@@ -322,6 +395,198 @@ class TestDownload(TransferTestCase):
         res = self.link.download("this name has spaces.txt", "B")
         self.assertFalse(res["ok"])
         self.assertIn("not a valid 8.3 CP/M filename", res["error"])
+
+
+class TestUploadFile(TransferTestCase):
+    """Path-based upload: the host file goes on the wire verbatim, straight to
+    the final target name - no zip staging, no UNZIP."""
+
+    def _host_file(self, data: bytes, name: str = "ledshow.com") -> str:
+        path = os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), name)
+        with open(path, "wb") as f:
+            f.write(data)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _responder_for(self, exists_before: bool = False):
+        state = {"exists": exists_before}
+
+        def _responder(line: bytes):
+            self.commands.append(line)
+            cmd = line.decode("latin-1").strip().upper()
+            if cmd.startswith("STAT") and cmd.endswith(":"):
+                return b"\r\nBytes Remaining On B: 4000k\r\nA>"
+            if cmd.startswith("STAT"):
+                return b"\r\n Recs  Bytes  Ext Acc\r\n   10     4k    1 R/W B:LEDSHOW.COM\r\nA>"
+            if cmd.startswith("DIR"):
+                if state["exists"]:
+                    # Echo the queried name back, as a real DIR hit would.
+                    queried = cmd[3:].strip().split(":")[-1]
+                    return f"\r\nB: {queried}\r\nA>".encode("latin-1")
+                return b"\r\nNO FILE\r\nA>"
+            if cmd.startswith("ERA"):
+                state["exists"] = False
+                return b"\r\nA>"
+            if "XM R" in cmd:
+                state["exists"] = True  # transfer landed the target file
+                return b"\r\nReceiving: B0:LEDSHOW.COM\r\nTo cancel: Ctrl-X\r\n"
+            return b"\r\nA>"
+
+        self.fake.responder = _responder
+        return state
+
+    def test_arms_xm_on_the_target_directly_and_sends_verbatim(self):
+        path = self._host_file(b"\x00\x01\x02raw bytes" + bytes([SUB]))
+        self._responder_for(exists_before=False)
+        res = self.link.upload_file(path, "B")
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["target"], "B:LEDSHOW.COM")
+        self.assertEqual(res["host_path"], path)
+        self.assertFalse(res["compressed"])
+        self.assertTrue(res["verified"])
+        self.assertIn("sha256", res)
+        # XM is armed on the final name - no .ZIP staging, no UNZIP.
+        self.assertIn("C:XM R B:LEDSHOW.COM", self.command_text())
+        self.assertFalse(any("UNZIP" in c or ".ZIP" in c
+                             for c in self.command_text()))
+        # The host path itself is handed to the wire protocol, not a tempfile.
+        self.link.xmodem_send.assert_called_once_with(path)
+        self.assertEqual(self.sent_zip_bytes[-1],
+                         b"\x00\x01\x02raw bytes" + bytes([SUB]))
+
+    def test_name_defaults_to_the_host_basename(self):
+        path = self._host_file(b"x", name="hello.txt")
+        self._responder_for(exists_before=False)
+        res = self.link.upload_file(path, "B")
+        self.assertEqual(res["target"], "B:HELLO.TXT")
+
+    def test_explicit_name_overrides_an_unusable_basename(self):
+        path = self._host_file(b"x", name="not a valid name.txt")
+        self._responder_for(exists_before=False)
+        res = self.link.upload_file(path, "B", name="OK.TXT")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["target"], "B:OK.TXT")
+
+    def test_rejects_an_invalid_derived_name(self):
+        path = self._host_file(b"x", name="not a valid name.txt")
+        res = self.link.upload_file(path, "B")
+        self.assertFalse(res["ok"])
+        self.assertIn("not a valid 8.3 CP/M filename", res["error"])
+        self.link.xmodem_send.assert_not_called()
+
+    def test_fails_on_a_missing_host_file(self):
+        res = self.link.upload_file(os.path.join(tempfile.gettempdir(),
+                                                 "definitely-not-there.bin"), "B")
+        self.assertFalse(res["ok"])
+        self.assertIn("host file not found", res["error"])
+        self.link.xmodem_send.assert_not_called()
+
+    def test_user_area_addressing(self):
+        path = self._host_file(b"hi", name="hello.txt")
+        self._responder_for(exists_before=False)
+        res = self.link.upload_file(path, "B", user=1)
+        self.assertEqual(res["target"], "B1:HELLO.TXT")
+        self.assertIn("C:XM R B1:HELLO.TXT", self.command_text())
+
+    def test_stops_when_target_exists_and_overwrite_is_disabled(self):
+        path = self._host_file(b"x")
+        self._responder_for(exists_before=True)
+        res = self.link.upload_file(path, "B", overwrite=False)
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["existed_before"])
+        self.assertIn("already exists", res["error"])
+        self.link.xmodem_send.assert_not_called()
+
+    def test_erases_the_existing_target_before_arming_xm_when_overwriting(self):
+        path = self._host_file(b"x")
+        self._responder_for(exists_before=True)
+        res = self.link.upload_file(path, "B", overwrite=True)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["replaced_existing"])
+        commands = self.command_text()
+        era_index = commands.index("ERA B:LEDSHOW.COM")
+        xm_index = next(i for i, c in enumerate(commands) if "XM R" in c)
+        self.assertLess(era_index, xm_index, "must erase before XM runs")
+
+    def test_stops_on_insufficient_space(self):
+        path = self._host_file(b"x" * 1000, name="big.bin")
+
+        def _responder(line: bytes):
+            self.commands.append(line)
+            cmd = line.decode("latin-1").strip().upper()
+            if cmd.startswith("STAT") and cmd.endswith(":"):
+                return b"\r\nBytes Remaining On B: 0k\r\nA>"
+            if cmd.startswith("DIR"):
+                return b"\r\nNO FILE\r\nA>"
+            return b"\r\nA>"
+
+        self.fake.responder = _responder
+        res = self.link.upload_file(path, "B")
+        self.assertFalse(res["ok"])
+        self.assertIn("insufficient space", res["error"])
+        self.link.xmodem_send.assert_not_called()
+
+    def test_refuses_when_no_os_is_running(self):
+        self.link._system_state = "hbios"
+        res = self.link.upload_file(self._host_file(b"x"), "B")
+        self.assertFalse(res["ok"])
+        self.assertIn("not at a CP/M prompt", res["error"])
+
+
+class TestDownloadFile(TransferTestCase):
+    """Path-based download: bytes land verbatim at the host destination, and
+    only metadata comes back."""
+
+    def _dest(self) -> str:
+        return os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "out.bin")
+
+    def test_receives_to_the_dest_path_and_returns_metadata(self):
+        dest = self._dest()
+        self.respond({b"XM SK": b"\r\nSending\r\n", b"DIR": b"\r\nB: LEDSHOW  COM\r\nA>"})
+        res = self.link.download_file("LEDSHOW.COM", "B", dest_path=dest)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["target"], "B:LEDSHOW.COM")
+        self.assertEqual(res["dest_path"], os.path.abspath(dest))
+        self.assertNotIn("content", res)
+        self.assertIn("sha256", res)
+        self.assertEqual(res["block_size"], 1024)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), self.received_payload)
+        self.assertIn("C:XM SK B:LEDSHOW.COM", self.command_text())
+
+    def test_never_strips_padding(self):
+        # A host file is where exact bytes live; trailing 0x1A records are the
+        # caller's to interpret.
+        self.received_payload = b"data" + bytes([SUB]) * 3
+        dest = self._dest()
+        self.respond({b"XM SK": b"\r\nSending\r\n", b"DIR": b"\r\nB: X.TXT\r\nA>"})
+        res = self.link.download_file("X.TXT", "B", dest_path=dest)
+        self.assertTrue(res["ok"], res)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), self.received_payload)
+        self.link.xmodem_receive.assert_called_once_with(dest, strip_padding=False)
+
+    def test_dest_defaults_to_the_cpm_filename(self):
+        self.respond({b"XM SK": b"\r\nSending\r\n", b"DIR": b"\r\nB: X.TXT\r\nA>"})
+        res = self.link.download_file("X.TXT", "B")
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["dest_path"].endswith("X.TXT"))
+        os.unlink(res["dest_path"])
+
+    def test_fails_fast_when_the_file_does_not_exist(self):
+        self.respond({b"DIR": b"\r\nNO FILE\r\nA>"})
+        res = self.link.download_file("MISSING.TXT", "B", dest_path=self._dest())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "not found")
+        self.link.xmodem_receive.assert_not_called()
+
+    def test_refuses_when_no_os_is_running(self):
+        self.link._system_state = "hbios"
+        res = self.link.download_file("X.COM", "B", dest_path=self._dest())
+        self.assertFalse(res["ok"])
+        self.assertIn("not at a CP/M prompt", res["error"])
 
 
 class TestReadTextFile(TransferTestCase):
